@@ -79,4 +79,4 @@ the particular sandbox in use, not of Apple Silicon Macs generally.
 - No release-binary benchmark or dependency vulnerability audit was performed.
 
 The package is an independently implemented small agent, not vendored code from
-IMPULSE, ROSA, Codex, or Grok Build. See provenance.md for the reuse decisions.
+any other project. See provenance.md for the reuse decisions.
