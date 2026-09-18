@@ -1,0 +1,31 @@
+# Explicit user-supplied configuration; replace model IDs before real use.
+# No credential values belong in this file.
+[connections.openrouter]
+protocol = "openai_chat"
+base_url = "https://openrouter.ai/api/v1"
+auth = { kind = "bearer_env", env = "OPENROUTER_API_KEY" }
+
+[connections.litellm]
+protocol = "openai_chat"
+base_url = "http://127.0.0.1:4000"
+auth = { kind = "bearer_env", env = "LITELLM_API_KEY" }
+
+[connections.local]
+protocol = "openai_chat"
+base_url = "http://127.0.0.1:11434/v1"
+auth = { kind = "none" }
+
+[models.openrouter]
+connection = "openrouter"
+model = "<tool-capable-model-id>"
+native_tools = true
+
+[models.litellm]
+connection = "litellm"
+model = "<configured-proxy-model-alias>"
+native_tools = true
+
+[models.local]
+connection = "local"
+model = "<installed-local-model-id>"
+native_tools = true
