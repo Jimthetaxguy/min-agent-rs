@@ -46,31 +46,25 @@ server's loopback bind. The HTTP integration test is not marked passed on Mac;
 it passed on Linux. A complete `cargo test` therefore exits nonzero in this
 particular Mac command sandbox.
 
-## Local placement
+## Second Apple Silicon Mac build (repo root)
 
-Verified source:
+Rust 1.98.1, same machine architecture as above. Run from the repository root
+after landing, rather than a temporary directory.
 
-```text
-/tmp/min-agent-verified-871e418e/min-agent-rs
-```
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo build --locked` | Passed |
+| `cargo test --locked` | 11 unit tests and 1 HTTP integration test passed |
+| `cargo clippy --locked --all-targets -- -D warnings` | Passed |
+| CLI `--help` | Passed |
+| Offline `doctor --profile local` | Passed |
+| `python3 tests/acceptance.py` | 11 checks passed |
 
-Mac executable:
-
-```text
-/tmp/min-agent-verified-871e418e/target/debug/min-agent
-```
-
-Intended durable destination:
-
-```text
-/Users/jamespustorino/code/min-agent-rs
-```
-
-The durable destination could not be created because the app reported no active
-writable workspace. Textual authorization was received, but it did not change
-the tool's filesystem grant. Nothing was written into existing repositories.
-The temporary directory is not a durable installation; preserve the source
-archive or move it into an approved workspace before relying on it.
+Unlike the first Mac run above, the local-command sandbox here permitted a
+loopback bind, so the HTTP integration test and the Python acceptance driver
+both ran and passed. Loopback-bind restrictions are therefore a property of
+the particular sandbox in use, not of Apple Silicon Macs generally.
 
 ## Limits of the verification
 
