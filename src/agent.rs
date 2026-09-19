@@ -81,6 +81,10 @@ impl Budget {
             "Byte budgets must be at least 4096"
         );
         ensure!(self.max_retries <= 10, "At most 10 retries");
+        ensure!(
+            self.wall_clock <= Duration::from_secs(7 * 24 * 3600),
+            "Wall-clock budget must be at most 7 days"
+        );
         Ok(())
     }
 }
@@ -153,7 +157,9 @@ impl fmt::Display for StopReason {
 #[derive(Clone, Debug, Serialize)]
 pub struct CallRecord {
     pub round: usize,
-    pub id: String,
+    /// 0-based ordinal of the call within the run. The provider's call ID is not recorded:
+    /// it is model-controlled text and could carry prompt or file content into the trace.
+    pub call: usize,
     pub tool: String,
     pub path: Option<String>,
     pub ok: bool,
@@ -219,7 +225,9 @@ pub fn run(
     let budget = &options.budget;
     budget.validate()?;
     let started = Instant::now();
-    let deadline = started + budget.wall_clock;
+    let deadline = started
+        .checked_add(budget.wall_clock)
+        .ok_or_else(|| anyhow::anyhow!("Wall-clock budget is too large"))?;
     let tools = if options.text_only {
         vec![]
     } else {
@@ -280,6 +288,10 @@ pub fn run(
             "elapsed_ms": report.elapsed_ms,
         }),
     );
+    if trace.failed() {
+        report.stop = StopReason::TraceFailed;
+        report.answer = None;
+    }
     Ok(report)
 }
 
@@ -359,9 +371,9 @@ fn drive(
                     }
                     let backoff = failure
                         .retry_after()
-                        .unwrap_or(Duration::from_millis(500 << (attempt - 1).min(4)))
-                        .min(Duration::from_secs(30));
-                    if Instant::now() + backoff >= deadline {
+                        .unwrap_or(Duration::from_millis(500 << (attempt - 1).min(4)));
+                    // A server-requested delay is honored in full or not at all.
+                    if backoff >= deadline.saturating_duration_since(Instant::now()) {
                         return StopReason::ProviderError {
                             failure,
                             attempts: attempt,
@@ -388,6 +400,10 @@ fn drive(
             "model_response",
             json!({"round":round,"attempts":attempt,"tool_calls":turn.calls.len(),"text_bytes":turn.text.len(),"usage":turn.usage}),
         );
+        // Stop before reading anything else if the audit record is already incomplete.
+        if trace.failed() {
+            return StopReason::TraceFailed;
+        }
         if turn.calls.is_empty() {
             report.answer = Some(turn.text);
             report.transcript.push(Item::Assistant(turn.native));
@@ -413,11 +429,9 @@ fn drive(
             let outcome = workspace.prepare(&call.name, call.arguments.clone());
             if let Err(error) = &outcome {
                 if error.kind == ToolErrorKind::UnknownTool {
+                    // The name is model-controlled, so it is not echoed into the stop reason.
                     return StopReason::InvalidResponse {
-                        reason: format!(
-                            "unknown tool {:?}",
-                            call.name.chars().take(64).collect::<String>()
-                        ),
+                        reason: "unknown tool".into(),
                     };
                 }
             }
@@ -453,17 +467,30 @@ fn drive(
                 });
                 continue;
             }
+            if trace.failed() {
+                halted = Some(StopReason::TraceFailed);
+                report.transcript.push(Item::ToolResult {
+                    call_id: call.id.clone(),
+                    content:
+                        json!({"error":{"kind":"io","message":"Not executed: trace write failed"}})
+                            .to_string(),
+                    is_error: true,
+                });
+                continue;
+            }
             let started = Instant::now();
             let path = outcome.as_ref().ok().map(|p| p.path().to_string());
             let result = outcome.and_then(|p| {
-                let tool_deadline = deadline.min(started + budget.tool_timeout);
+                let tool_deadline = started
+                    .checked_add(budget.tool_timeout)
+                    .map_or(deadline, |t| deadline.min(t));
                 workspace.execute(p, tool_deadline, budget.max_tool_output_bytes)
             });
             report.tool_calls += 1;
             let record = match &result {
                 Ok(output) => CallRecord {
                     round,
-                    id: call.id.clone(),
+                    call: report.tool_calls - 1,
                     tool: call.name.clone(),
                     path,
                     ok: true,
@@ -475,7 +502,7 @@ fn drive(
                 },
                 Err(error) => CallRecord {
                     round,
-                    id: call.id.clone(),
+                    call: report.tool_calls - 1,
                     tool: call.name.clone(),
                     path,
                     ok: false,
@@ -822,6 +849,104 @@ mod tests {
                 limit: Limit::ContextBytes
             }
         );
+    }
+
+    /// Accepts the first `n` trace lines, then fails every later write.
+    struct FailAfterLines(usize);
+    impl std::io::Write for FailAfterLines {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.0 == 0 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            self.0 -= buf.iter().filter(|b| **b == b'\n').count();
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn trace_failure_stops_before_tools_and_at_run_end() {
+        let (_t, w) = workspace();
+        let tool_then_done = || {
+            Script::new(vec![
+                Ok(turn_with(
+                    vec![call(0, "read_file", json!({"path":"hello.txt"}))],
+                    "",
+                )),
+                Ok(turn_with(vec![], "done")),
+            ])
+        };
+        // run_start is written; model_response fails, before the tool batch.
+        let mut trace = Trace::to_writer(Box::new(FailAfterLines(1)));
+        let report = run(
+            &tool_then_done(),
+            &w,
+            "t",
+            &RunOptions::default(),
+            &mut trace,
+        )
+        .unwrap();
+        assert_eq!(report.stop, StopReason::TraceFailed);
+        assert_eq!(report.rounds, 1);
+        assert_eq!(
+            report.tool_calls, 0,
+            "no tool may run after a trace failure"
+        );
+        // run_start, model_response, tool_call, model_response succeed; run_end fails.
+        let mut trace = Trace::to_writer(Box::new(FailAfterLines(4)));
+        let report = run(
+            &tool_then_done(),
+            &w,
+            "t",
+            &RunOptions::default(),
+            &mut trace,
+        )
+        .unwrap();
+        assert_eq!(report.tool_calls, 1);
+        assert_eq!(
+            report.rounds, 2,
+            "the model finished; only the final record failed"
+        );
+        assert_eq!(report.stop, StopReason::TraceFailed);
+        assert!(report.answer.is_none());
+    }
+
+    #[test]
+    fn long_retry_after_is_not_shortened() {
+        let (_t, w) = workspace();
+        // Retry-After 120 s does not fit a 60 s run: stop now instead of retrying early.
+        let throttled = Script::new(vec![Err(ModelError::Provider(ProviderFailure::Status {
+            code: 429,
+            retry_after: Some(Duration::from_secs(120)),
+        }))]);
+        let short = with_budget(Budget {
+            wall_clock: Duration::from_secs(60),
+            ..Budget::default()
+        });
+        let started = Instant::now();
+        let report = go(&throttled, &w, short);
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert!(matches!(
+            report.stop,
+            StopReason::ProviderError { attempts: 1, .. }
+        ));
+    }
+
+    #[test]
+    fn oversized_wall_clock_is_a_configuration_error() {
+        let (_t, w) = workspace();
+        let huge = RunOptions {
+            budget: Budget {
+                wall_clock: Duration::from_secs(u64::MAX),
+                ..Budget::default()
+            },
+            ..RunOptions::default()
+        };
+        let model = Repeating(AtomicUsize::new(0));
+        assert!(run(&model, &w, "t", &huge, &mut Trace::disabled()).is_err());
+        assert_eq!(model.0.load(Ordering::SeqCst), 0);
     }
 
     #[test]

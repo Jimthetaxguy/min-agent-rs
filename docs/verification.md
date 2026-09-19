@@ -8,7 +8,7 @@ Verified on September 18, 2026 on Apple Silicon macOS, Rust 1.98.1, from the rep
 | --- | --- |
 | `cargo fmt --check` | Passed |
 | `cargo clippy --locked --all-targets -- -D warnings` | Passed |
-| `cargo test --locked` | 44 unit tests, 9 HTTP integration tests passed; 1 live test ignored (opt-in) |
+| `cargo test --locked` | 47 unit tests, 9 HTTP integration tests passed; 1 live test ignored (opt-in) |
 | `cargo build --locked` | Passed |
 | `python3 tests/acceptance.py <binary>` | 25 checks passed |
 | `cargo deny check` | advisories, bans, licenses, sources ok |
@@ -42,6 +42,10 @@ loopback-HTTP endpoint (now refused), redaction bypass by offset, page split, or
 probing (now context-window redaction and redacted search), missing credential filenames,
 usage undercount after failed attempts, a deadline-capped timeout reported as a provider
 error, silently skipped search files, and a hardlink search test that passed vacuously.
+A follow-up automated PR review found five more, fixed with tests: provider call IDs and
+unknown tool names reaching traces, tools running after a failed trace write, a failed final
+trace line not failing the run, `Retry-After` clamped to 30 s, and an overflowing wall-clock
+budget panicking instead of erroring.
 
 The acceptance driver previously checked for an `Authorization` header with a
 case-sensitive lookup against lowercase header names, so its "no credential sent" check

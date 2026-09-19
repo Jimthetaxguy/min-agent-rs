@@ -77,7 +77,8 @@ tool with the same error kind stop the run, as do three identical consecutive ba
 Argument key order does not affect the repeated-batch check.
 
 Transient provider failures (timeouts, connection errors, 408/429/5xx/529) are retried
-up to `max_retries` times per round, honoring `Retry-After`, within the run deadline.
+up to `max_retries` times per round within the run deadline. A `Retry-After` delay is
+honored in full; if it does not fit in the remaining run time, the run stops instead.
 Model requests are effect-free here; tools are never retried. A request whose timeout was
 shortened by the run deadline stops as `wall_clock`, not as a provider error. Token usage
 becomes unknown (`null`) after any failed attempt that may have generated output.
@@ -137,10 +138,12 @@ With `--trace FILE`, each run appends JSON lines of the form
 `{"v":1,"seq":N,"wall_time":<unix ms>,"run_id":"...","kind":"...","payload":{...}}`.
 Kinds: `run_start` (profile, protocol, endpoint, model, connection fingerprint, policy
 version, tool list, effects, effective budget, workspace), `model_response`,
-`model_error`, `tool_call` (tool, path, ok or error kind, bytes, truncated, redacted),
+`model_error`, `tool_call` (call ordinal, tool, path, ok or error kind, bytes, truncated, redacted),
 and `run_end` (stop reason, counts, token usage). Unknown usage is recorded as `null`,
 not zero. Readers must skip kinds they do not recognize. Traces contain no file content,
-prompts, or model text.
+prompts, model text, or other model-controlled strings (provider call IDs and unknown tool
+names are not recorded). If any trace write fails, the run stops before its next tool call
+and ends as `TraceFailed`, including when only the final `run_end` line fails.
 
 ## Not applicable by construction
 
