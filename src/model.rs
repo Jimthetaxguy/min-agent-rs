@@ -1,237 +1,317 @@
-use crate::config::{endpoint, Connection, ModelProfile};
-use anyhow::{bail, ensure, Context, Result};
+//! Protocol-neutral model seam plus the one bounded HTTP transport all adapters share.
+use crate::{
+    adapters,
+    config::{proxy_url, Connection, ModelProfile, Protocol},
+};
+use anyhow::{Context, Result};
 use reqwest::{blocking::Client, header};
-use serde_json::{json, Value};
-use std::{collections::HashSet, io::Read, time::Duration};
+use serde::Serialize;
+use serde_json::Value;
+use std::{fmt, io::Read, time::Duration};
 
-pub const RESPONSE_LIMIT: usize = 1_048_576;
-pub const CONTEXT_LIMIT: usize = 262_144;
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
     pub arguments: Value,
 }
 
+/// Tool schema in neutral form; each adapter renders its own wire shape.
+#[derive(Debug, Clone)]
+pub struct ToolSpec {
+    pub name: &'static str,
+    pub description: &'static str,
+    pub parameters: Value,
+}
+
+/// One conversation entry. `Assistant` holds the provider's native output verbatim
+/// (Chat message, Responses output items, or Messages content blocks) so opaque
+/// continuation such as reasoning replays unchanged within the same run and client.
+#[derive(Debug, Clone)]
+pub enum Item {
+    User(String),
+    Assistant(Value),
+    ToolResult {
+        call_id: String,
+        content: String,
+        is_error: bool,
+    },
+}
+
+/// Token counts as reported by the provider. Unknown is `None`, never zero.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
+pub struct Usage {
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub reasoning_tokens: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct ModelTurn {
-    pub message: Value,
+    pub native: Value,
     pub text: String,
     pub calls: Vec<ToolCall>,
+    pub usage: Option<Usage>,
 }
 
-pub trait ModelClient {
-    fn turn(&self, messages: &[Value], tools: &[Value], remaining: Duration) -> Result<ModelTurn>;
+/// Per-request limits handed down from the run's `Budget`.
+#[derive(Debug, Clone, Copy)]
+pub struct RequestLimits {
+    pub timeout: Duration,
+    pub max_request_bytes: usize,
+    pub max_response_bytes: usize,
 }
 
-pub struct ChatClient {
-    client: Client,
-    endpoint: url::Url,
-    profile: ModelProfile,
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ProviderFailure {
+    Timeout,
+    Connect,
+    Transport,
+    Status {
+        code: u16,
+        #[serde(skip)]
+        retry_after: Option<Duration>,
+    },
+    BodyTooLarge,
+    BodyRead,
+    UnexpectedContentType,
+    ErrorEnvelope,
 }
 
-impl ChatClient {
-    pub fn new(connection: &Connection, profile: &ModelProfile) -> Result<Self> {
-        let mut headers = header::HeaderMap::new();
-        if let Some(key) = connection.auth.credential()? {
-            let mut value = header::HeaderValue::from_str(&format!("Bearer {key}"))
-                .map_err(|_| anyhow::anyhow!("Credential is not a valid HTTP header"))?;
-            value.set_sensitive(true);
-            headers.insert(header::AUTHORIZATION, value);
+impl ProviderFailure {
+    /// Model requests are effect-free for this agent, so transient failures may be
+    /// retried within the run deadline. Client errors (4xx other than 408/429) are not.
+    pub fn retryable(&self) -> bool {
+        match self {
+            Self::Timeout | Self::Connect | Self::BodyRead => true,
+            Self::Status { code, .. } => matches!(code, 408 | 429 | 500 | 502 | 503 | 504 | 529),
+            _ => false,
         }
-        let client = Client::builder()
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .no_proxy()
-            .build()
-            .context("Cannot construct HTTP client")?;
-        Ok(Self {
-            client,
-            endpoint: endpoint(&connection.base_url)?,
-            profile: profile.clone(),
-        })
+    }
+
+    pub fn retry_after(&self) -> Option<Duration> {
+        match self {
+            Self::Status { retry_after, .. } => *retry_after,
+            _ => None,
+        }
     }
 }
 
-impl ModelClient for ChatClient {
-    fn turn(&self, messages: &[Value], tools: &[Value], remaining: Duration) -> Result<ModelTurn> {
-        ensure!(!remaining.is_zero(), "BudgetExceeded: wall-clock deadline");
-        let mut body = json!({"model": self.profile.model, "messages": messages, "stream": false});
-        if !tools.is_empty() {
-            body["tools"] = json!(tools);
+impl fmt::Display for ProviderFailure {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Timeout => f.write_str("request timed out"),
+            Self::Connect => f.write_str("connection failed"),
+            Self::Transport => f.write_str("HTTP transport failed"),
+            Self::Status { code, .. } => write!(f, "HTTP status {code}"),
+            Self::BodyTooLarge => f.write_str("response exceeds byte limit"),
+            Self::BodyRead => f.write_str("response read failed"),
+            Self::UnexpectedContentType => f.write_str("unexpected response content type"),
+            Self::ErrorEnvelope => f.write_str("API error envelope"),
         }
-        if let Some(max) = self.profile.max_output_tokens {
-            body[self
-                .profile
-                .output_limit_parameter
-                .as_deref()
-                .unwrap_or("max_tokens")] = json!(max);
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum ModelError {
+    /// The serialized request would exceed the context byte budget; nothing was sent.
+    RequestTooLarge,
+    Provider(ProviderFailure),
+    /// The response violated the protocol contract; no call in it is authorized.
+    Invalid(String),
+}
+
+impl From<ProviderFailure> for ModelError {
+    fn from(failure: ProviderFailure) -> Self {
+        Self::Provider(failure)
+    }
+}
+
+pub(crate) fn invalid<T>(reason: &str) -> Result<T, ModelError> {
+    Err(ModelError::Invalid(reason.to_string()))
+}
+
+pub trait ModelClient {
+    fn turn(
+        &self,
+        system: &str,
+        items: &[Item],
+        tools: &[ToolSpec],
+        limits: RequestLimits,
+    ) -> Result<ModelTurn, ModelError>;
+}
+
+/// HTTP model client for any configured protocol.
+pub struct HttpModelClient {
+    client: Client,
+    endpoint: url::Url,
+    protocol: Protocol,
+    profile: ModelProfile,
+}
+
+impl HttpModelClient {
+    pub fn new(connection: &Connection, profile: &ModelProfile) -> Result<Self> {
+        connection.validate()?;
+        let mut headers = header::HeaderMap::new();
+        if let Some((name, secret)) = connection.auth.credential()? {
+            let name = header::HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| anyhow::anyhow!("Invalid credential header name"))?;
+            let mut value = header::HeaderValue::from_str(&secret)
+                .map_err(|_| anyhow::anyhow!("Credential is not a valid HTTP header"))?;
+            value.set_sensitive(true);
+            headers.insert(name, value);
         }
-        let bytes = serde_json::to_vec(&body)?;
-        ensure!(
-            bytes.len() <= CONTEXT_LIMIT,
-            "BudgetExceeded: request/context bytes"
-        );
+        if connection.protocol == Protocol::AnthropicMessages {
+            headers.insert(
+                "anthropic-version",
+                header::HeaderValue::from_static("2023-06-01"),
+            );
+        }
+        // `no_proxy` clears ambient proxy discovery; an explicit proxy is added after.
+        let mut builder = Client::builder()
+            .default_headers(headers)
+            .redirect(reqwest::redirect::Policy::none())
+            .connect_timeout(Duration::from_secs(10))
+            .no_proxy();
+        if let Some(proxy) = &connection.proxy {
+            let proxy = reqwest::Proxy::all(proxy_url(proxy)?.as_str())
+                .context("Invalid proxy configuration")?;
+            builder = builder.proxy(proxy);
+        }
+        Ok(Self {
+            client: builder.build().context("Cannot construct HTTP client")?,
+            endpoint: connection.endpoint()?,
+            protocol: connection.protocol,
+            profile: profile.clone(),
+        })
+    }
+
+    fn post(&self, body: &Value, limits: RequestLimits) -> Result<Value, ModelError> {
+        let bytes = serde_json::to_vec(body).map_err(|_| ModelError::RequestTooLarge)?;
+        if bytes.len() > limits.max_request_bytes {
+            return Err(ModelError::RequestTooLarge);
+        }
         let response = self
             .client
             .post(self.endpoint.clone())
             .header(header::CONTENT_TYPE, "application/json")
-            .timeout(remaining.min(Duration::from_secs(90)))
+            .timeout(limits.timeout)
             .body(bytes)
             .send()
-            .map_err(|_| anyhow::anyhow!("ProviderError: HTTP transport failed or timed out"))?;
-        ensure!(
-            response.status().is_success(),
-            "ProviderError: HTTP status {}",
-            response.status().as_u16()
-        );
-        if let Some(len) = response.content_length() {
-            ensure!(
-                len <= RESPONSE_LIMIT as u64,
-                "ProviderError: response exceeds byte limit"
-            );
+            .map_err(|error| {
+                if error.is_timeout() {
+                    ProviderFailure::Timeout
+                } else if error.is_connect() {
+                    ProviderFailure::Connect
+                } else {
+                    ProviderFailure::Transport
+                }
+            })?;
+        let status = response.status();
+        if !status.is_success() {
+            let retry_after = response
+                .headers()
+                .get(header::RETRY_AFTER)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.trim().parse::<u64>().ok())
+                .map(Duration::from_secs);
+            return Err(ProviderFailure::Status {
+                code: status.as_u16(),
+                retry_after,
+            }
+            .into());
         }
+        // Absent Content-Type is tolerated (some local servers omit it); anything that is
+        // not JSON, notably an SSE stream answering a `stream:false` request, is rejected.
+        if let Some(kind) = response.headers().get(header::CONTENT_TYPE) {
+            let kind = kind.to_str().unwrap_or("").to_ascii_lowercase();
+            if !kind.starts_with("application/json") {
+                return Err(ProviderFailure::UnexpectedContentType.into());
+            }
+        }
+        if response
+            .content_length()
+            .is_some_and(|len| len > limits.max_response_bytes as u64)
+        {
+            return Err(ProviderFailure::BodyTooLarge.into());
+        }
+        // Enforced while reading: a chunked body without Content-Length cannot exceed it.
         let mut bytes = Vec::new();
         response
-            .take(RESPONSE_LIMIT as u64 + 1)
+            .take(limits.max_response_bytes as u64 + 1)
             .read_to_end(&mut bytes)
-            .map_err(|_| anyhow::anyhow!("ProviderError: response read failed"))?;
-        ensure!(
-            bytes.len() <= RESPONSE_LIMIT,
-            "ProviderError: response exceeds byte limit"
-        );
-        let response: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| anyhow::anyhow!("InvalidResponse: malformed JSON"))?;
-        parse_turn(response)
+            .map_err(|error| {
+                if read_timed_out(&error) {
+                    ProviderFailure::Timeout
+                } else {
+                    ProviderFailure::BodyRead
+                }
+            })?;
+        if bytes.len() > limits.max_response_bytes {
+            return Err(ProviderFailure::BodyTooLarge.into());
+        }
+        serde_json::from_slice(&bytes).or_else(|_| invalid("malformed JSON"))
     }
 }
 
-pub fn parse_turn(response: Value) -> Result<ModelTurn> {
-    ensure!(
-        response.get("error").is_none(),
-        "ProviderError: API error envelope"
-    );
-    let choices = response["choices"]
-        .as_array()
-        .context("InvalidResponse: missing choices")?;
-    ensure!(
-        choices.len() == 1,
-        "InvalidResponse: expected exactly one choice"
-    );
-    let choice = &choices[0];
-    ensure!(choice.get("error").is_none(), "ProviderError: choice error");
-    let reason = choice["finish_reason"]
-        .as_str()
-        .context("InvalidResponse: missing completion reason")?;
-    ensure!(
-        matches!(reason, "stop" | "tool_calls"),
-        "InvalidResponse: incomplete, refused, or unsupported finish reason"
-    );
-    let message = &choice["message"];
-    ensure!(
-        message["role"] == "assistant",
-        "InvalidResponse: expected assistant role"
-    );
-    ensure!(
-        message.get("refusal").is_none_or(Value::is_null),
-        "InvalidResponse: model refused"
-    );
-    ensure!(
-        message.get("function_call").is_none(),
-        "InvalidResponse: legacy function calls unsupported"
-    );
-    let text = match message.get("content") {
-        None | Some(Value::Null) => String::new(),
-        Some(Value::String(s)) => s.clone(),
-        _ => bail!("InvalidResponse: non-text content unsupported"),
-    };
-    let raw_calls: &[Value] = match message.get("tool_calls") {
-        None | Some(Value::Null) => &[],
-        Some(Value::Array(calls)) => calls,
-        _ => bail!("InvalidResponse: invalid tool_calls field"),
-    };
-    ensure!(
-        raw_calls.len() <= 40,
-        "InvalidResponse: excessive tool batch"
-    );
-    let mut ids = HashSet::new();
-    let mut calls = Vec::new();
-    for raw in raw_calls {
-        ensure!(
-            raw["type"] == "function",
-            "InvalidResponse: unsupported tool type"
-        );
-        let id = raw["id"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .context("InvalidResponse: missing tool call ID")?;
-        ensure!(ids.insert(id), "InvalidResponse: duplicate tool call ID");
-        let name = raw["function"]["name"]
-            .as_str()
-            .filter(|s| !s.is_empty())
-            .context("InvalidResponse: missing tool name")?;
-        let args = raw["function"]["arguments"]
-            .as_str()
-            .context("InvalidResponse: missing arguments string")?;
-        let arguments: Value = serde_json::from_str(args)
-            .map_err(|_| anyhow::anyhow!("InvalidResponse: malformed tool arguments"))?;
-        ensure!(
-            arguments.is_object(),
-            "InvalidResponse: tool arguments must be an object"
-        );
-        calls.push(ToolCall {
-            id: id.into(),
-            name: name.into(),
-            arguments,
-        });
+/// Body reads surface the request deadline as an `io::Error` wrapping a reqwest timeout.
+fn read_timed_out(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        return true;
     }
-    ensure!(
-        (reason == "tool_calls") != calls.is_empty(),
-        "InvalidResponse: finish reason and tool calls disagree"
-    );
-    ensure!(
-        !calls.is_empty() || !text.trim().is_empty(),
-        "InvalidResponse: empty final answer"
-    );
-    // Preserve extensions (including opaque reasoning) verbatim within this run.
-    Ok(ModelTurn {
-        message: message.clone(),
-        text,
-        calls,
-    })
+    let mut source: Option<&(dyn std::error::Error + 'static)> = error.get_ref().map(|e| e as _);
+    while let Some(current) = source {
+        if current
+            .downcast_ref::<reqwest::Error>()
+            .is_some_and(reqwest::Error::is_timeout)
+            || current
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+        {
+            return true;
+        }
+        source = current.source();
+    }
+    false
+}
+
+impl ModelClient for HttpModelClient {
+    fn turn(
+        &self,
+        system: &str,
+        items: &[Item],
+        tools: &[ToolSpec],
+        limits: RequestLimits,
+    ) -> Result<ModelTurn, ModelError> {
+        let body = adapters::request(self.protocol, &self.profile, system, items, tools);
+        let response = self.post(&body, limits)?;
+        adapters::parse(self.protocol, response)
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn response(args: &str, reason: &str) -> Value {
-        json!({"choices":[{"finish_reason":reason,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"c","type":"function","function":{"name":"read_file","arguments":args}}]}}]})
-    }
-
     #[test]
-    fn validates_native_arguments_and_completion() {
-        assert!(parse_turn(response("{}", "tool_calls")).is_ok());
-        for (args, reason) in [
-            ("{", "tool_calls"),
-            ("[]", "tool_calls"),
-            ("{}", "length"),
-            ("{}", "stop"),
-        ] {
-            assert!(parse_turn(response(args, reason)).is_err());
+    fn retry_classification() {
+        for code in [408, 429, 500, 502, 503, 504, 529] {
+            assert!(ProviderFailure::Status {
+                code,
+                retry_after: None
+            }
+            .retryable());
         }
-    }
-
-    #[test]
-    fn rejects_duplicate_ids() {
-        let mut r = response("{}", "tool_calls");
-        let c = r["choices"][0]["message"]["tool_calls"][0].clone();
-        r["choices"][0]["message"]["tool_calls"]
-            .as_array_mut()
-            .unwrap()
-            .push(c);
-        assert!(parse_turn(r).is_err());
+        for code in [400, 401, 403, 404, 422] {
+            assert!(!ProviderFailure::Status {
+                code,
+                retry_after: None
+            }
+            .retryable());
+        }
+        assert!(ProviderFailure::Timeout.retryable());
+        assert!(!ProviderFailure::BodyTooLarge.retryable());
+        assert!(!ProviderFailure::UnexpectedContentType.retryable());
     }
 }
