@@ -1,48 +1,62 @@
 # CONTEXT.md - Ubiquitous Language Glossary
 
 **min-agent** is a small, read-only, protocol-oriented Rust coding agent: one library, one thin
-CLI, one bounded tool loop, and one OpenAI Chat Completions adapter. It is the first verified
-slice of the fx-inspired design in `_working-files/minimal-rust-agent-design.md` — a walking
-skeleton, not a finished replacement for fx, Codex, or Grok Build. See `README.md` for build/use
-and `docs/verification.md` / `docs/provenance.md` for what has actually been checked and reused.
+CLI, one bounded tool loop, and three wire adapters (OpenAI Chat, OpenAI Responses, Anthropic
+Messages). It reads a workspace and answers questions; it never edits or executes. See
+`README.md` for use, `docs/verification.md` for what was checked, `docs/compatibility.md` for
+live-model results, and `docs/provenance.md` for reuse decisions.
 
 ## Domain Vocabulary
 
-- **Connection**: Where a request goes — protocol, base URL, and auth method (`config.rs`).
-  Independent from **Model Profile**, which is which model/features are permitted on top of a
-  connection. A user picks a named profile (e.g. `local`, `openrouter`); the agent never guesses.
-- **Auth**: `None` or `BearerEnv { env }` — credentials are read only from the exact named
-  environment variable in the config, never inferred or borrowed from another tool's store.
-- **ModelClient**: The seam between the bounded loop (`agent.rs`) and the wire protocol
-  (`model.rs`). `ChatClient` is the only implementation today (OpenAI Chat Completions); Responses
-  and Anthropic Messages adapters are designed but not yet built.
-- **ModelTurn / ToolCall**: The normalized result of one model round — visible text plus zero or
-  more native tool calls, with the original assistant message preserved verbatim so opaque
-  extensions (e.g. `reasoning_content`) replay correctly within the same run.
-- **Budget**: Per-run limits — model rounds, total tool calls, wall-clock deadline, and a
-  repeated-tool-batch breaker (`agent.rs::Budget`). A run always ends with a typed stop reason,
-  never a silent success on a budget cut.
-- **Text-only mode**: No tool schema is sent and no tool call can execute — set explicitly via
-  `--text-only` or a model profile's `native_tools = false`.
-- **Workspace / Prepared**: `tools.rs`. `Workspace` opens a directory as a `cap-std` capability
-  (beneath-root resolution enforced at open, not just canonicalize-then-open). `prepare()`
-  validates a tool call's arguments and path policy *before* any content is read; `execute()` then
-  performs the bounded read. The three tools are `list_files`, `read_file`, `search_text` — all
-  read-only.
-- **Typed stop reasons**: Errors are prefixed so callers can distinguish `BudgetExceeded`,
-  `InvalidResponse` (malformed/refused/incomplete model output), and `ProviderError` (transport or
-  HTTP-status failure) from each other and from ordinary Rust errors.
-- **doctor**: An offline CLI subcommand that resolves configuration and checks credential presence
-  without making any model request.
+- **Connection**: Where a request goes: `protocol`, base URL, `auth`, optional explicit `proxy`
+  (`config.rs`). Its **fingerprint** is a stable FNV-1a hash of protocol, endpoint, auth
+  description, and proxy presence; it contains no secret.
+- **Model Profile**: Which model and features are used on a connection (model ID, native tools,
+  output-token limit). A user picks a named profile; the agent never guesses.
+- **Protocol**: `openai_chat`, `openai_responses`, or `anthropic_messages`. Each has an
+  **adapter** in `adapters/` that renders requests and validates responses.
+- **Auth**: `None`, `BearerEnv { env }`, or `HeaderEnv { header, env }`. Credentials come only
+  from the named environment variable.
+- **Item**: One neutral conversation entry: `User`, `Assistant(native)`, or `ToolResult`.
+  `Assistant` holds the provider's native output verbatim, so opaque continuation (reasoning,
+  signatures) replays unchanged within one run and one client.
+- **ModelClient / ModelTurn**: The seam between the loop and the wire. A turn is visible text,
+  native tool calls, the native output, and optional **Usage** (unknown is `None`, never zero).
+- **ModelError**: `RequestTooLarge`, `Provider(ProviderFailure)`, or `Invalid(reason)`.
+  `ProviderFailure::retryable()` decides bounded retry.
+- **Budget**: Every run limit in one struct: rounds, calls, run deadline, request and tool
+  timeouts, retries, repeat limit, and request/response/tool-output byte caps.
+- **StopReason**: The typed end of a run: `Completed`, `BudgetExceeded { limit }`,
+  `ProviderError { failure, attempts }`, `InvalidResponse { reason }`, `TraceFailed`. Only
+  `Completed` is success.
+- **RunReport**: Returned by every run: stop reason, answer (only if completed), last text,
+  counts, usage, per-call **CallRecord**s (metadata only), and the transcript.
+- **Protocol violation vs environment answer**: Malformed arguments, duplicate IDs, unknown
+  tool, truncation, or refusal stop the run as `InvalidResponse` with nothing executed. Not
+  found, denied, wrong type, or invalid arguments are returned to the model as tool errors.
+- **Error streak / repeated batch**: The two loop breakers: N consecutive failures of the same
+  tool and error kind, or N identical consecutive batches (argument key order ignored).
+- **Workspace / Prepared / Effect**: `tools.rs`. `Workspace` is a `cap-std` directory
+  capability. `prepare()` validates arguments and path policy before any read and returns an
+  opaque `Prepared`; `execute()` performs the bounded read. `Effect` has one variant, `Read`;
+  adding a variant is gated on the entry criteria in the README.
+- **Redaction**: Known credential shapes in tool output become `[REDACTED]` (`redact.rs`).
+  A backstop, not a scanner.
+- **Trace**: Optional append-only JSONL run record `{v, seq, wall_time, run_id, kind, payload}`;
+  metadata only; readers skip unknown kinds.
+- **Text-only mode**: No tool schema is sent and no tool call can execute.
+- **doctor**: Offline config and credential-presence check; no model request.
+- **Graduation test**: `tests/live.rs`, opt-in, synthetic workspace with a planted fact; each
+  run adds a row to `docs/compatibility.md`.
 
-## Current state
+## Current state (2026-09-18)
 
-Landed and verified on this machine 2026-09-18: `cargo fmt`, `cargo build --locked`,
-`cargo test --locked` (11 unit + 1 HTTP integration test), `cargo clippy --all-targets -D
-warnings`, and the Python black-box acceptance driver (11/11) all pass. Not yet decided: whether
-this gets a GitHub remote (see `docs/verification.md` and session notes — deliberately left as an
-open question rather than assumed).
+0.2.0: the read-only agent is feature-complete for this design stage. Three adapters with
+shared conformance fixtures and real HTTP round trips; typed stops; recoverable tool errors;
+bounded retry; JSONL trace; deterministic, UTF-8-safe, fit-to-cap tools; redaction; hardened
+CI with MSRV 1.88 and cargo-deny. Live runs so far: local Ollama only (see
+`docs/compatibility.md`). Hosted-provider graduation needs explicit authorization.
 
-Deferred by design (see `README.md` "Not included yet"): Responses/Anthropic Messages adapters,
-persistent sessions, file edits, shell execution, streaming, MCP, TUI, provider switching within a
-run, and any live-provider testing.
+Deferred by design: edit/exec (gated on effect typing, attempt fencing, digest-bound
+approval, and a process supervisor), sessions, streaming, compaction, MCP, TUI, and
+in-run provider switching.

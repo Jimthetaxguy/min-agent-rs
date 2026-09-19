@@ -29,3 +29,34 @@ native_tools = true
 connection = "local"
 model = "<installed-local-model-id>"
 native_tools = true
+
+# Native OpenAI Responses (stateless: store=false, encrypted reasoning replayed).
+[connections.openai]
+protocol = "openai_responses"
+base_url = "https://api.openai.com/v1"
+auth = { kind = "bearer_env", env = "OPENAI_API_KEY" }
+
+# Native Anthropic Messages; the header name is explicit, not inferred.
+[connections.anthropic]
+protocol = "anthropic_messages"
+base_url = "https://api.anthropic.com/v1"
+auth = { kind = "header_env", header = "x-api-key", env = "ANTHROPIC_API_KEY" }
+
+# A connection may name an explicit proxy; ambient HTTP(S)_PROXY is never used.
+# [connections.corp]
+# protocol = "openai_chat"
+# base_url = "https://gateway.example.com/v1"
+# auth = { kind = "bearer_env", env = "GATEWAY_API_KEY" }
+# proxy = "http://proxy.example.com:3128"
+
+[models.openai]
+connection = "openai"
+model = "<responses-model-id>"
+native_tools = true
+max_output_tokens = 4096
+
+[models.anthropic]
+connection = "anthropic"
+model = "<messages-model-id>"
+native_tools = true
+max_output_tokens = 4096
