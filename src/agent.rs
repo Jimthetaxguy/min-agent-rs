@@ -689,8 +689,22 @@ fn perform_call(
         .map_or(env.deadline, |t| env.deadline.min(t));
     let (path, mut result) = match ready {
         Ready::Saved(parsed) => {
-            let result = parsed
-                .and_then(|request| env.store.read(request, env.budget.max_tool_output_bytes));
+            // Reserve the warning envelope before paginating so adding it cannot
+            // trim content while leaving next_offset past bytes the model received.
+            let reserve = if next >= REPEAT_WARN {
+                json!({"repeat_warning": repeat_warning_text(next)})
+                    .to_string()
+                    .len()
+                    - 1
+            } else {
+                0
+            };
+            let result = parsed.and_then(|request| {
+                env.store.read(
+                    request,
+                    env.budget.max_tool_output_bytes.saturating_sub(reserve),
+                )
+            });
             (None, result)
         }
         Ready::Workspace(parsed) => {
@@ -767,10 +781,12 @@ fn annotate_saved(capped: &str, id: &str, limit: usize) -> String {
     fit_string_field(&mut value, limit)
 }
 
+fn repeat_warning_text(count: usize) -> String {
+    format!("Identical tool call {count} of {REPEAT_STOP}. Do not repeat this call. The run stops at {REPEAT_STOP}.")
+}
+
 fn attach_repeat_warning(content: &str, count: usize, limit: usize) -> String {
-    let warning = format!(
-        "Identical tool call {count} of {REPEAT_STOP}. Do not repeat this call. The run stops at {REPEAT_STOP}."
-    );
+    let warning = repeat_warning_text(count);
     let mut value: Value =
         serde_json::from_str(content).unwrap_or_else(|_| json!({"text": content}));
     if !value.is_object() {
@@ -1535,6 +1551,55 @@ mod tests {
         assert!(report.calls[1].result_id.is_none());
         // The saved file is outside the workspace, and a foreign id is not a workspace read.
         assert!(!temp.path().join("r0.txt").exists());
+    }
+
+    #[test]
+    fn repeated_saved_pages_keep_offsets_consistent_with_warning_content() {
+        let (temp, w) = workspace();
+        std::fs::write(temp.path().join("nul.bin"), vec![0u8; 8192]).unwrap();
+        let results = tempfile::tempdir().unwrap();
+        let mut steps = vec![Ok(turn_with(
+            vec![call(0, "read_file", json!({"path":"nul.bin"}))],
+            "",
+        ))];
+        for n in 1..=5 {
+            steps.push(Ok(turn_with(
+                vec![
+                    call(n * 2, "read_tool_result", json!({"result_id":"r0"})),
+                    call(n * 2 + 1, "list_files", json!({"limit":n})),
+                ],
+                "",
+            )));
+        }
+        steps.push(Ok(turn_with(vec![], "done")));
+        let options = RunOptions {
+            budget: Budget {
+                max_tool_output_bytes: 4096,
+                ..Budget::default()
+            },
+            result_dir: Some(results.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        let report = go(&Script::new(steps), &w, options);
+        assert_eq!(report.stop, StopReason::Completed);
+        let mut pages = 0;
+        let mut warnings = 0;
+        for item in &report.transcript {
+            if let Item::ToolResult { content, .. } = item {
+                let value: Value = serde_json::from_str(content).unwrap();
+                if value.get("total_bytes").is_some() && value["result_id"] == "r0" {
+                    assert!(content.len() <= 4096);
+                    assert_eq!(
+                        value["next_offset"].as_u64().unwrap() as usize,
+                        value["content"].as_str().unwrap().len()
+                    );
+                    pages += 1;
+                    warnings += usize::from(value.get("repeat_warning").is_some());
+                }
+            }
+        }
+        assert_eq!(pages, 5);
+        assert_eq!(warnings, 1);
     }
 
     #[test]
