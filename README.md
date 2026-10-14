@@ -27,6 +27,8 @@ is offline and makes no model requests.
 | --- | --- |
 | `--trace FILE` | Append a JSONL run trace (metadata only) to `FILE` |
 | `--report-json` | Print the full run report as JSON on stderr |
+| `--summary-dir DIR` | Write one `{run_id}.json` summary (model, settings, steps, tokens, tool outcomes). Default: `$TMPDIR/min-agent` |
+| `--result-dir DIR` | Where truncated tool output is saved for `read_tool_result`. Default: `$TMPDIR/min-agent/{run_id}` |
 | `--max-rounds`, `--max-calls` | Override the round and tool-call budgets |
 | `--timeout-secs`, `--request-timeout-secs` | Override the run and per-request deadlines |
 | `--max-retries` | Retries of transient provider failures per round |
@@ -65,7 +67,7 @@ Every run returns a `RunReport` with a typed `StopReason`:
 | Stop reason | Meaning |
 | --- | --- |
 | `Completed` | The model gave a final answer |
-| `BudgetExceeded { limit }` | `rounds`, `tool_calls`, `wall_clock`, `context_bytes`, `repeated_batch`, or `repeated_tool_error` |
+| `BudgetExceeded { limit }` | `rounds`, `tool_calls`, `wall_clock`, `context_bytes`, `repeated_batch`, `repeated_tool_error`, or `repeated_tool_call` |
 | `ProviderError { failure, attempts }` | Transport, timeout, HTTP status, oversize or non-JSON body, or provider error envelope |
 | `InvalidResponse { reason }` | The model broke the protocol: malformed or non-object arguments, duplicate or reused call IDs, unknown tool, truncated or refused output, or tool calls in text-only mode. Nothing in that response runs |
 | `TraceFailed` | A requested trace could not be written, so the run stopped rather than continue unaudited |
@@ -74,7 +76,10 @@ A budget stop is never reported as success. Tool errors caused by the environmen
 (file not found, path denied, wrong file type, invalid arguments) are **returned to the
 model as tool results** so it can correct itself. Three consecutive failures of the same
 tool with the same error kind stop the run, as do three identical consecutive batches.
-Argument key order does not affect the repeated-batch check.
+Argument key order does not affect the repeated-batch check. Separately, an identical
+tool call (same name and canonical arguments, including across different batches) warns
+the model at 5 and stops the run at 8, before that 8th call runs. The warning count and
+the stop are on the `RunReport`.
 
 Transient provider failures (timeouts, connection errors, 408/429/5xx/529) are retried
 up to `max_retries` times per round within the run deadline. A `Retry-After` delay is
@@ -85,8 +90,9 @@ becomes unknown (`null`) after any failed attempt that may have generated output
 
 Default budget (`agent::Budget`, all overridable by library callers): 10 rounds, 40 tool
 calls, 180 s run deadline, 90 s per model request, 20 s per tool call, 2 retries,
-repeat limit 3, 256 KiB request, 1 MiB response, 32 KiB tool result. There are no other
-run limits. Tool-level scan limits are listed below and are part of each tool's contract.
+repeat limit 3, 256 KiB request, 1 MiB response, 32 KiB tool result. Identical tool
+calls warn at 5 and stop at 8; those two thresholds are fixed. Tool-level scan limits
+are listed below and are part of each tool's contract.
 
 ## Tools
 
@@ -95,11 +101,15 @@ run limits. Tool-level scan limits are listed below and are part of each tool's 
 | `list_files` | Immediate entries of one directory, sorted by name; examines at most 5,000 entries |
 | `read_file` | Up to 8,192 bytes from a byte offset; pages end on UTF-8 character boundaries; paginate with `next_offset` |
 | `search_text` | Literal search over redacted text, depth-first in name order: at most 20,000 entries, depth 8, 256 KiB per file, 16 MiB total; binary, unreadable, and hardlinked files are counted in `skipped_files` |
+| `read_tool_result` | Read-only page of a saved full tool result (`result_id`, byte `offset` / `limit`). It cannot read the workspace |
 
 Every result reports truncation. Output that would exceed the tool-result cap is
 shortened to fit (a read page ends earlier; lists and searches return fewer items)
-rather than failing. Paths in results are workspace-relative (`src/main.rs`, never
-`./src/main.rs`).
+rather than failing. Whenever a result is truncated, the full tool text is saved
+outside the workspace. The model still receives the capped result, including fields
+such as `next_offset`, plus a `result_id`, and can page the saved text with
+`read_tool_result`. Paths in results are workspace-relative (`src/main.rs`, never
+`./src/main.rs`). Saved results live in the system temp directory, or in `--result-dir`.
 
 ## Filesystem and privacy boundaries
 

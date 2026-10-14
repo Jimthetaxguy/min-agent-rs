@@ -173,9 +173,36 @@ impl Prepared {
 /// Successful tool output plus metadata for the run record.
 #[derive(Debug)]
 pub struct ToolOutput {
+    /// Text that fits the output cap. This is what a caller sends on if it does not spill.
     pub content: String,
+    /// Complete tool text when `content` was shortened to the cap. `None` when `content` is complete.
+    pub full_text: Option<String>,
     pub truncated: bool,
     pub redacted: usize,
+}
+
+impl ToolOutput {
+    fn new(
+        content: String,
+        full: String,
+        truncated: bool,
+        redacted: usize,
+        output_limit: usize,
+    ) -> ToolResult<Self> {
+        if content.len() > output_limit {
+            return Err(ToolError::new(
+                ToolErrorKind::Io,
+                "Tool output exceeded its cap",
+            ));
+        }
+        let full_text = (full.len() > content.len()).then_some(full);
+        Ok(Self {
+            content,
+            truncated: truncated || full_text.is_some(),
+            full_text,
+            redacted,
+        })
+    }
 }
 
 fn dot() -> String {
@@ -424,28 +451,38 @@ impl Workspace {
             Op::List(a) => {
                 let path = self.directory(&a.path, "list_files")?;
                 let (all, mut truncated) = self.sorted_entries(&path, LIST_SCAN_LIMIT, deadline)?;
-                let mut entries = Vec::new();
+                let mut fitting = Vec::new();
+                let mut full = Vec::new();
                 let mut used = 0;
+                let mut capped = false;
                 for (name, kind) in all {
                     if blocked(&name) || kind.is_symlink() || (!kind.is_file() && !kind.is_dir()) {
                         continue;
                     }
-                    let entry =
-                        json!({"name":name,"kind":if kind.is_dir() {"directory"} else {"file"}});
-                    used += size(&entry) + 1;
-                    if entries.len() >= a.limit || used > budget {
+                    if full.len() >= a.limit {
                         truncated = true;
                         break;
                     }
-                    entries.push(entry);
+                    let entry =
+                        json!({"name":name,"kind":if kind.is_dir() {"directory"} else {"file"}});
+                    if !capped {
+                        used += size(&entry) + 1;
+                        if fitting.len() >= a.limit || used > budget {
+                            truncated = true;
+                            capped = true;
+                        } else {
+                            fitting.push(entry.clone());
+                        }
+                    }
+                    full.push(entry);
                 }
-                ToolOutput {
-                    content: json!({"path":display(&path),"entries":entries,"truncated":truncated,"scan_limit":LIST_SCAN_LIMIT}).to_string(),
-                    truncated,
-                    redacted: 0,
-                }
+                let body = |entries: Vec<Value>| {
+                    json!({"path":display(&path),"entries":entries,"truncated":truncated,"scan_limit":LIST_SCAN_LIMIT})
+                        .to_string()
+                };
+                ToolOutput::new(body(fitting), body(full), truncated, 0, output_limit)?
             }
-            Op::Search(a) => self.search(a, deadline, budget)?,
+            Op::Search(a) => self.search(a, deadline, budget, output_limit)?,
         };
         check_deadline(deadline)?;
         debug_assert!(output.content.len() <= output_limit);
@@ -503,7 +540,8 @@ impl Workspace {
             }
             (value.to_string(), truncated, redacted)
         };
-        let mut rendered = render(end);
+        let full = render(end);
+        let mut rendered = full.clone();
         if rendered.0.len() > output_limit {
             // Escaping (control characters become \u00XX) can inflate content; shrink the
             // page to fit rather than failing, and let the model paginate from next_offset.
@@ -519,22 +557,27 @@ impl Workspace {
             end = char_end(bytes, lo);
             rendered = render(end);
         }
-        Ok(ToolOutput {
-            content: rendered.0,
-            truncated: rendered.1,
-            redacted: rendered.2,
-        })
+        ToolOutput::new(rendered.0, full.0, rendered.1, rendered.2, output_limit)
     }
 
-    fn search(&self, a: SearchArgs, deadline: Instant, budget: usize) -> ToolResult<ToolOutput> {
+    fn search(
+        &self,
+        a: SearchArgs,
+        deadline: Instant,
+        budget: usize,
+        output_limit: usize,
+    ) -> ToolResult<ToolOutput> {
         let start = self.directory(&a.path, "search_text")?;
         let mut pending = vec![(start, 0usize)];
         let mut scanned = 0usize;
         let mut bytes_read = 0u64;
         let mut hits = Vec::new();
+        let mut full_hits = Vec::new();
         let mut used = 0;
+        let mut output_capped = false;
         let mut truncated = false;
         let mut redacted_total = 0;
+        let mut shown_redacted = 0;
         let mut skipped = 0usize;
         'walk: while let Some((dir, depth)) = pending.pop() {
             let remaining = SEARCH_SCAN_LIMIT - scanned;
@@ -592,13 +635,22 @@ impl Workspace {
                     }
                     let snippet: String = content.chars().take(160).collect();
                     let hit = json!({"path":rel,"line":line + 1,"text":snippet});
-                    used += size(&hit) + 1;
-                    if hits.len() >= a.limit || used > budget {
+                    if full_hits.len() >= a.limit {
                         truncated = true;
                         break 'walk;
                     }
+                    if !output_capped {
+                        used += size(&hit) + 1;
+                        if hits.len() >= a.limit || used > budget {
+                            truncated = true;
+                            output_capped = true;
+                        } else {
+                            shown_redacted += redacted;
+                            hits.push(hit.clone());
+                        }
+                    }
                     redacted_total += redacted;
-                    hits.push(hit);
+                    full_hits.push(hit);
                 }
             }
             if scanned >= SEARCH_SCAN_LIMIT {
@@ -609,15 +661,20 @@ impl Workspace {
             pending.extend(subdirs.into_iter().rev());
         }
         // `skipped_files` counts binary, unreadable, and hardlinked files: not searched.
-        let mut value = json!({"matches":hits,"truncated":truncated,"entries_scanned":scanned,"skipped_files":skipped,"scan_limit":SEARCH_SCAN_LIMIT});
-        if redacted_total > 0 {
-            value["redacted"] = json!(redacted_total);
-        }
-        Ok(ToolOutput {
-            content: value.to_string(),
+        let body = |matches: Vec<Value>, redacted: usize| {
+            let mut value = json!({"matches":matches,"truncated":truncated,"entries_scanned":scanned,"skipped_files":skipped,"scan_limit":SEARCH_SCAN_LIMIT});
+            if redacted > 0 {
+                value["redacted"] = json!(redacted);
+            }
+            value.to_string()
+        };
+        ToolOutput::new(
+            body(hits, shown_redacted),
+            body(full_hits, redacted_total),
             truncated,
-            redacted: redacted_total,
-        })
+            redacted_total,
+            output_limit,
+        )
     }
 }
 
@@ -645,6 +702,142 @@ fn char_end(bytes: &[u8], limit: usize) -> usize {
     end
 }
 
+/// Saved full tool output. The model can page it with `read_tool_result` and cannot choose the directory.
+#[derive(Debug)]
+pub struct SavedResults {
+    dir: PathBuf,
+}
+
+#[derive(Debug)]
+pub struct SavedRequest {
+    pub result_id: String,
+    offset: usize,
+    limit: usize,
+}
+
+impl SavedResults {
+    pub fn new(dir: PathBuf) -> Self {
+        Self { dir }
+    }
+
+    pub fn dir(&self) -> &Path {
+        &self.dir
+    }
+
+    pub fn prepare(arguments: Value) -> ToolResult<SavedRequest> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct Args {
+            result_id: String,
+            #[serde(default)]
+            offset: usize,
+            #[serde(default = "default_bytes")]
+            limit: usize,
+        }
+        let a: Args = serde_json::from_value(arguments)
+            .map_err(|e| ToolError::new(ToolErrorKind::InvalidArguments, e.to_string()))?;
+        if a.limit == 0 || a.limit > READ_LIMIT {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                "Read limit must be 1..8192 bytes",
+            ));
+        }
+        Ok(SavedRequest {
+            result_id: a.result_id,
+            offset: a.offset,
+            limit: a.limit,
+        })
+    }
+
+    /// Writes the full tool text. The id is chosen by the agent (`r0`, `r1`, ...).
+    pub fn save(&self, id: &str, text: &str) -> ToolResult<PathBuf> {
+        let path = self.path(id)?;
+        std::fs::create_dir_all(&self.dir).map_err(|_| {
+            ToolError::new(
+                ToolErrorKind::Io,
+                "Could not create the tool-result directory",
+            )
+        })?;
+        write_private(&path, text.as_bytes())?;
+        Ok(path)
+    }
+
+    /// One page of a previously saved tool result. Read-only.
+    pub fn read(&self, request: SavedRequest) -> ToolResult<ToolOutput> {
+        let path = self.path(&request.result_id)?;
+        let text = std::fs::read_to_string(&path).map_err(|error| match error.kind() {
+            io::ErrorKind::NotFound => {
+                ToolError::new(ToolErrorKind::NotFound, "Saved tool result not found")
+            }
+            _ => ToolError::new(ToolErrorKind::Io, "Could not read the saved tool result"),
+        })?;
+        if request.offset > text.len() {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                "Read offset exceeds result length",
+            ));
+        }
+        if !text.is_char_boundary(request.offset) {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                "Read offset splits a character",
+            ));
+        }
+        let page = &text.as_bytes()[request.offset..];
+        let end = char_end(page, request.limit.min(page.len()));
+        let next = request.offset + end;
+        let truncated = next < text.len();
+        let content = json!({
+            "result_id": request.result_id,
+            "offset": request.offset,
+            "next_offset": next,
+            "total_bytes": text.len(),
+            "truncated": truncated,
+            "content": &text[request.offset..next],
+        })
+        .to_string();
+        Ok(ToolOutput {
+            content,
+            full_text: None,
+            truncated,
+            redacted: 0,
+        })
+    }
+
+    fn path(&self, id: &str) -> ToolResult<PathBuf> {
+        if id.is_empty() || id.len() > 32 || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                "result_id must be 1..32 letters or digits",
+            ));
+        }
+        Ok(self.dir.join(format!("{id}.txt")))
+    }
+}
+
+fn write_private(path: &Path, bytes: &[u8]) -> ToolResult<()> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .map_err(|_| ToolError::new(ToolErrorKind::Io, "Could not save the full tool output"))?;
+    std::io::Write::write_all(&mut file, bytes)
+        .map_err(|_| ToolError::new(ToolErrorKind::Io, "Could not save the full tool output"))
+}
+
+/// Every offered tool is a read. `read_tool_result` reads only saved output, not the workspace.
+pub fn tool_effect(name: &str) -> Option<Effect> {
+    match name {
+        "list_files" | "read_file" | "read_tool_result" | "search_text" => Some(Effect::Read),
+        _ => None,
+    }
+}
+
 /// Tool schemas, sorted by name so the catalog bytes are stable across runs.
 pub fn definitions() -> Vec<ToolSpec> {
     vec![
@@ -657,6 +850,11 @@ pub fn definitions() -> Vec<ToolSpec> {
             name: "read_file",
             description: "Read a regular nonsecret workspace file. offset/limit are bytes; pages end on UTF-8 boundaries. Maximum 8192 bytes; paginate using next_offset. Known credential formats are redacted.",
             parameters: json!({"type":"object","properties":{"path":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":8192}},"required":["path"],"additionalProperties":false}),
+        },
+        ToolSpec {
+            name: "read_tool_result",
+            description: "Read a page of a saved full tool output by result_id. offset and limit are bytes; pages end on UTF-8 boundaries. Read-only. Does not access the workspace.",
+            parameters: json!({"type":"object","properties":{"result_id":{"type":"string"},"offset":{"type":"integer","minimum":0},"limit":{"type":"integer","minimum":1,"maximum":8192}},"required":["result_id"],"additionalProperties":false}),
         },
         ToolSpec {
             name: "search_text",
@@ -951,6 +1149,9 @@ mod tests {
         let mut sorted = names.clone();
         sorted.sort_unstable();
         assert_eq!(names, sorted);
+        for name in &names {
+            assert_eq!(tool_effect(name), Some(Effect::Read), "{name}");
+        }
         for (name, args) in [
             ("list_files", json!({})),
             ("read_file", json!({"path":"f"})),
@@ -960,6 +1161,61 @@ mod tests {
             assert_eq!(prepared.effect(), Effect::Read);
             assert_eq!(prepared.tool(), name);
         }
+        assert_eq!(
+            w.prepare("read_tool_result", json!({"result_id":"r0"}))
+                .err()
+                .unwrap()
+                .kind,
+            ToolErrorKind::UnknownTool
+        );
+    }
+
+    #[test]
+    fn oversized_tool_text_is_kept_beside_the_capped_page() {
+        let temp = tempfile::tempdir().unwrap();
+        std::fs::write(temp.path().join("nul.bin"), vec![0u8; 8192]).unwrap();
+        let w = Workspace::open(temp.path()).unwrap();
+        let call = w.prepare("read_file", json!({"path":"nul.bin"})).unwrap();
+        let out = w.execute(call, later(), 4_096).unwrap();
+        assert!(out.content.len() <= 4_096);
+        let full = out.full_text.expect("uncapped page");
+        assert!(full.len() > out.content.len());
+        assert!(full.matches("\\u0000").count() > out.content.matches("\\u0000").count());
+    }
+
+    #[test]
+    fn saved_results_page_and_reject_foreign_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        let text = "abcdefghij".repeat(1000);
+        saved.save("r0", &text).unwrap();
+        let page = saved
+            .read(SavedResults::prepare(json!({"result_id":"r0","limit":8})).unwrap())
+            .unwrap();
+        let value: Value = serde_json::from_str(&page.content).unwrap();
+        assert_eq!(value["content"], "abcdefgh");
+        assert_eq!(value["next_offset"], 8);
+        assert_eq!(value["truncated"], true);
+        assert_eq!(value["total_bytes"], text.len());
+        let rest = saved
+            .read(SavedResults::prepare(json!({"result_id":"r0","offset":text.len() - 4})).unwrap())
+            .unwrap();
+        let rest: Value = serde_json::from_str(&rest.content).unwrap();
+        assert_eq!(rest["truncated"], false);
+        assert_eq!(rest["content"], &text[text.len() - 4..]);
+        for bad in ["../r0", "r0.txt", "", "r0/x", "not-a-real-id"] {
+            let error = saved
+                .read(SavedResults::prepare(json!({"result_id": bad})).unwrap())
+                .err()
+                .unwrap();
+            assert_eq!(error.kind, ToolErrorKind::InvalidArguments, "{bad}");
+            assert!(!temp.path().join("r0").exists());
+        }
+        let missing = saved
+            .read(SavedResults::prepare(json!({"result_id":"r9"})).unwrap())
+            .err()
+            .unwrap();
+        assert_eq!(missing.kind, ToolErrorKind::NotFound);
     }
 
     #[test]

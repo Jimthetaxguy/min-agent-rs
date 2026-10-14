@@ -50,7 +50,10 @@ fn live_provider_graduation() {
     let options = RunOptions {
         text_only,
         budget: Budget::default(),
+        model: model.model.clone(),
+        summary_dir: Some(temp.path().join("summaries")),
         meta: json!({"profile": profile, "live": true}),
+        ..RunOptions::default()
     };
     let report = run(
         &client,
