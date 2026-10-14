@@ -75,7 +75,7 @@ impl BudgetArgs {
 
 #[cfg_attr(test, derive(Debug))]
 enum Parsed {
-    Run(Cli),
+    Run(Box<Cli>),
     Help(String),
     Version,
 }
@@ -542,7 +542,7 @@ fn parse_command(
             prompt,
         }
     };
-    Ok(Parsed::Run(Cli { config, command }))
+    Ok(Parsed::Run(Box::new(Cli { config, command })))
 }
 
 fn split_flag(arg: &str) -> (&str, Option<&str>) {
@@ -662,7 +662,7 @@ fn exit_code(stop: &StopReason) -> u8 {
 
 fn execute() -> Result<u8> {
     let cli = match parse_env() {
-        Ok(Parsed::Run(cli)) => cli,
+        Ok(Parsed::Run(cli)) => *cli,
         Ok(Parsed::Help(text)) => {
             println!("{text}");
             return Ok(0);
