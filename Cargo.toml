@@ -8,14 +8,32 @@ license = "MIT"
 repository = "https://github.com/Jimthetaxguy/min-agent-rs"
 
 [dependencies]
-anyhow = "1"
+anyhow = { version = "1", default-features = false, features = ["std"] }
 cap-std = "3"
-clap = { version = "4", features = ["derive"] }
+# Explicit clap features are the user-facing CLI: help, usage, error context,
+# typo suggestions, and color. Defaults such as wrap_help are left off.
+clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color"] }
+# Already minimal: no native-tls, http2, http3, gzip, brotli, charset, or cookies.
+# rustls-tls is ring + webpki roots (no rustls logging feature). Verified with cargo tree.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-toml = "0.8"
-url = "2"
+serde = { version = "1", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1", default-features = false, features = ["std"] }
+# Config is parsed only; the TOML display/serializer feature is unused.
+toml = { version = "0.8", default-features = false, features = ["parse"] }
+url = { version = "2", default-features = false, features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+# Release size budget: scripts/check-release-size.sh.
+# opt-level "z" measured smaller than "s" on x86_64-unknown-linux-gnu.
+# panic stays unwind. tokio's task harness catch_unwinds panics inside the
+# reqwest blocking runtime; abort would turn those into process aborts.
+# Transitive tokio features in use are io-util, net, rt, sync, and time
+# (current-thread). rt-multi-thread, fs, process, signal, and macros are off.
+[profile.release]
+strip = true
+lto = true
+codegen-units = 1
+opt-level = "z"
+panic = "unwind"
