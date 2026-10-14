@@ -417,7 +417,7 @@ def test_trace_is_metadata_only(binary):
     header = lines[0]["payload"]
     assert header["meta"]["profile"] == "fixture"
     assert header["meta"]["connection_fingerprint"]
-    assert header["tools"] == ["list_files", "read_file", "search_text"]
+    assert header["tools"] == ["list_files", "read_file", "read_tool_result", "search_text"]
     assert header["effects"] == ["read"]
     assert lines[2]["payload"]["path"] == "hello.txt" and lines[2]["payload"]["bytes"] > 0
     assert lines[-1]["payload"]["stop"]["kind"] == "completed"

@@ -129,7 +129,7 @@ fn chat_round_trip() {
     assert!(first.head.starts_with("POST /v1/chat/completions "));
     assert!(!first.head.to_lowercase().contains("authorization:"));
     assert_eq!(first.body["model"], "fixture");
-    assert_eq!(first.body["tools"].as_array().unwrap().len(), 3);
+    assert_eq!(first.body["tools"].as_array().unwrap().len(), 4);
     let messages = &second.body["messages"];
     assert_eq!(messages[2]["reasoning_content"], "opaque");
     assert_eq!(messages[3]["tool_call_id"], "call_test");

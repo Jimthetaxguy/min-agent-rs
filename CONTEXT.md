@@ -29,13 +29,15 @@ live-model results, and `docs/provenance.md` for reuse decisions.
 - **StopReason**: The typed end of a run: `Completed`, `BudgetExceeded { limit }`,
   `ProviderError { failure, attempts }`, `InvalidResponse { reason }`, `TraceFailed`. Only
   `Completed` is success.
-- **RunReport**: Returned by every run: stop reason, answer (only if completed), last text,
-  counts, usage, per-call **CallRecord**s (metadata only), and the transcript.
+- **RunReport**: Returned by every run: model, run settings, stop reason, answer (only if
+  completed), last text, counts, identical-call warnings, usage, per-call **CallRecord**s
+  (metadata only), an optional summary path, and the transcript.
 - **Protocol violation vs environment answer**: Malformed arguments, duplicate IDs, unknown
   tool, truncation, or refusal stop the run as `InvalidResponse` with nothing executed. Not
   found, denied, wrong type, or invalid arguments are returned to the model as tool errors.
-- **Error streak / repeated batch**: The two loop breakers: N consecutive failures of the same
-  tool and error kind, or N identical consecutive batches (argument key order ignored).
+- **Error streak / repeated batch / identical call**: The loop breakers: N consecutive
+  failures of the same tool and error kind, N identical consecutive batches (argument key
+  order ignored), and identical calls across the run (warn the model at 5, stop at 8).
 - **Workspace / Prepared / Effect**: `tools.rs`. `Workspace` is a `cap-std` directory
   capability. `prepare()` validates arguments and path policy before any read and returns an
   opaque `Prepared`; `execute()` performs the bounded read. `Effect` has one variant, `Read`;
@@ -49,7 +51,12 @@ live-model results, and `docs/provenance.md` for reuse decisions.
 - **Graduation test**: `tests/live.rs`, opt-in, synthetic workspace with a planted fact; each
   run adds a row to `docs/compatibility.md`.
 
-## Current state (2026-09-18)
+- **Saved tool result**: When tool output is truncated, the full text is written outside the
+  workspace. `read_tool_result` pages that text. It is read-only and is not a workspace path.
+- **Run summary**: One JSON object per run (`{run_id}.json`) with model, settings, steps,
+  tokens, and each tool call's outcome.
+
+## Current state (2026-10-14)
 
 0.2.0: the read-only agent is feature-complete for this design stage. Three adapters with
 shared conformance fixtures and real HTTP round trips; typed stops; recoverable tool errors;

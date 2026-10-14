@@ -34,6 +34,8 @@ enum Command {
         text_only: bool,
         trace: Option<PathBuf>,
         report_json: bool,
+        summary_dir: Option<PathBuf>,
+        result_dir: Option<PathBuf>,
         budget: BudgetArgs,
         prompt: String,
     },
@@ -73,7 +75,7 @@ impl BudgetArgs {
 
 #[cfg_attr(test, derive(Debug))]
 enum Parsed {
-    Run(Cli),
+    Run(Box<Cli>),
     Help(String),
     Version,
 }
@@ -138,6 +140,8 @@ const ASK_FLAGS: &[&str] = &[
     "--text-only",
     "--trace",
     "--report-json",
+    "--summary-dir",
+    "--result-dir",
     "--max-rounds",
     "--max-calls",
     "--timeout-secs",
@@ -248,6 +252,8 @@ fn ask_help(color: bool) -> String {
     let text_only = paint(color, "1", "--text-only");
     let trace = paint(color, "1", "--trace");
     let report = paint(color, "1", "--report-json");
+    let summary_dir = paint(color, "1", "--summary-dir");
+    let result_dir = paint(color, "1", "--result-dir");
     let rounds = paint(color, "1", "--max-rounds");
     let calls = paint(color, "1", "--max-calls");
     let timeout = paint(color, "1", "--timeout-secs");
@@ -273,6 +279,10 @@ Ask a model, optionally using bounded read-only workspace tools
           Append a JSONL run trace (metadata only, no file contents) to this file
       {report}
           Print the run report as JSON to stderr instead of a one-line summary
+      {summary_dir} <DIR>
+          Directory for this run's JSON summary (`{{run_id}}.json`). Default: `$TMPDIR/min-agent`
+      {result_dir} <DIR>
+          Directory for full tool text saved when a result is truncated. Default: `$TMPDIR/min-agent/{{run_id}}`
       {rounds} <MAX_ROUNDS>
       {calls} <MAX_CALLS>
       {timeout} <TIMEOUT_SECS>
@@ -355,6 +365,8 @@ fn parse_command(
     let mut text_only = false;
     let mut trace = None;
     let mut report_json = false;
+    let mut summary_dir = None;
+    let mut result_dir = None;
     let mut budget = BudgetArgs {
         max_rounds: None,
         max_calls: None,
@@ -424,6 +436,22 @@ fn parse_command(
                     "--report-json" => {
                         reject_inline(flag, inline)?;
                         report_json = true;
+                    }
+                    "--summary-dir" => {
+                        summary_dir = Some(PathBuf::from(require_value(
+                            args,
+                            index,
+                            "--summary-dir <DIR>",
+                            inline,
+                        )?));
+                    }
+                    "--result-dir" => {
+                        result_dir = Some(PathBuf::from(require_value(
+                            args,
+                            index,
+                            "--result-dir <DIR>",
+                            inline,
+                        )?));
                     }
                     "--max-rounds" => {
                         budget.max_rounds = Some(parse_number(
@@ -508,11 +536,13 @@ fn parse_command(
             text_only,
             trace,
             report_json,
+            summary_dir,
+            result_dir,
             budget,
             prompt,
         }
     };
-    Ok(Parsed::Run(Cli { config, command }))
+    Ok(Parsed::Run(Box::new(Cli { config, command })))
 }
 
 fn split_flag(arg: &str) -> (&str, Option<&str>) {
@@ -632,7 +662,7 @@ fn exit_code(stop: &StopReason) -> u8 {
 
 fn execute() -> Result<u8> {
     let cli = match parse_env() {
-        Ok(Parsed::Run(cli)) => cli,
+        Ok(Parsed::Run(cli)) => *cli,
         Ok(Parsed::Help(text)) => {
             println!("{text}");
             return Ok(0);
@@ -669,6 +699,8 @@ fn execute() -> Result<u8> {
             text_only,
             trace,
             report_json,
+            summary_dir,
+            result_dir,
             budget,
             prompt,
         } => {
@@ -679,6 +711,11 @@ fn execute() -> Result<u8> {
             let options = RunOptions {
                 text_only: text_only || !model.native_tools,
                 budget: budget.budget(),
+                model: model.model.clone(),
+                summary_dir: Some(
+                    summary_dir.unwrap_or_else(|| std::env::temp_dir().join("min-agent")),
+                ),
+                result_dir,
                 meta: json!({
                     "profile": profile,
                     "protocol": connection.protocol.to_string(),
@@ -704,6 +741,9 @@ fn execute() -> Result<u8> {
             let report = run(&client, &workspace, &prompt, &options, &mut trace)?;
             if let Some(answer) = &report.answer {
                 println!("{answer}");
+            }
+            if let Some(path) = &report.summary_path {
+                eprintln!("Summary: {}", path.display());
             }
             if report_json {
                 eprintln!("{}", serde_json::to_string_pretty(&report)?);
@@ -751,7 +791,7 @@ mod tests {
             matches!(help, Parsed::Help(text) if text.contains("doctor") && text.contains("--config"))
         );
         assert!(
-            matches!(parse_args(&args(&["ask", "--help"]), false).unwrap(), Parsed::Help(text) if text.contains("--request-timeout-secs"))
+            matches!(parse_args(&args(&["ask", "--help"]), false).unwrap(), Parsed::Help(text) if text.contains("--request-timeout-secs") && text.contains("--summary-dir") && text.contains("--result-dir"))
         );
         assert!(matches!(
             parse_args(&args(&["--version"]), false).unwrap(),
@@ -781,6 +821,9 @@ mod tests {
                 "--max-rounds",
                 "4",
                 "--max-retries=1",
+                "--summary-dir",
+                "/tmp/summaries",
+                "--result-dir=/tmp/results",
                 "--",
                 "--not-a-flag",
             ]),
@@ -797,6 +840,8 @@ mod tests {
                         text_only,
                         budget,
                         prompt,
+                        summary_dir,
+                        result_dir,
                         ..
                     } => {
                         assert_eq!(profile, "local");
@@ -805,6 +850,8 @@ mod tests {
                         assert_eq!(budget.max_rounds, Some(4));
                         assert_eq!(budget.max_retries, Some(1));
                         assert_eq!(prompt, "--not-a-flag");
+                        assert_eq!(summary_dir, Some(PathBuf::from("/tmp/summaries")));
+                        assert_eq!(result_dir, Some(PathBuf::from("/tmp/results")));
                     }
                     Command::Doctor { .. } => panic!("doctor"),
                 }
