@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
-"""Held-out scorecard. A fixed set of tasks against a loopback fake model.
+"""Deterministic black-box regression scorecard against a loopback fake model.
 
-This is not the development suite in acceptance.py. Each task is one point.
+Separate from acceptance.py, but public fixtures are not a blind held-out
+model evaluation. Each task is one point; no model capability is measured.
 The script writes a JSON score file and exits non-zero if any point is lost,
 so a later change can be checked for a regression. No provider credential is used.
 """
 import argparse
+import hashlib
 import json
+import platform
 import os
 from pathlib import Path
 import subprocess
@@ -97,23 +100,41 @@ def run_task(binary, workspace, prompt, respond, extra=()):
         config = root / "config.toml"
         with ModelServer(respond) as server:
             write_config(config, server.base_url)
-            env = dict(os.environ)
-            for key in list(env):
-                if any(part in key.upper() for part in ("API_KEY", "TOKEN", "SECRET")):
-                    del env[key]
+            # Only process essentials: no provider credentials, proxy settings,
+            # user config, or shared summary/result directories are inherited.
+            env = {key: os.environ[key] for key in ("PATH", "SYSTEMROOT") if key in os.environ}
+            env.update(HOME=str(root), TMPDIR=str(root), LANG="C", LC_ALL="C")
+            trace = root / "trace.jsonl"
             result = subprocess.run(
                 [
                     binary, "--config", str(config), "ask",
                     "--profile", "heldout", "--workspace", str(workspace),
+                    "--summary-dir", str(root / "summaries"),
+                    "--result-dir", str(root / "results"), "--trace", str(trace),
                     *extra, prompt,
                 ],
-                capture_output=True, text=True, timeout=30, env=env,
+                capture_output=True, text=True, encoding="utf-8", timeout=30, env=env, cwd=root,
             )
+            result.trace = [json.loads(line) for line in trace.read_text().splitlines()] if trace.exists() else []
             return result, server.requests
 
 
 def tool_messages(request):
     return [m for m in request["body"].get("messages", []) if m.get("role") == "tool"]
+
+
+def tool_content(request, identity):
+    matches = [m for m in tool_messages(request) if m.get("tool_call_id") == identity]
+    return json.loads(matches[0]["content"]) if len(matches) == 1 else {}
+
+
+def no_secret(result, requests):
+    return SECRET not in result.stdout + result.stderr + json.dumps(requests) + json.dumps(result.trace)
+
+
+def workspace_snapshot(workspace):
+    return {str(path.relative_to(workspace)): ("dir" if path.is_dir() else path.read_bytes())
+            for path in workspace.rglob("*")}
 
 
 def score(checks):
@@ -137,26 +158,32 @@ def task_recall_planted_fact(binary, workspace):
         if index == 0:
             return completion(calls=[call(
                 "search_text",
-                json.dumps({"path": "docs", "query": FACT}),
+                json.dumps({"path": "docs", "query": "launch code"}),
                 "search_1",
             )])
         if index == 1:
+            hits = tool_content({"body": _payload}, "search_1").get("matches", [])
+            if len(hits) != 1:
+                return completion("No unique launch note found.")
             return completion(calls=[call(
-                "read_file",
-                json.dumps({"path": "docs/notes/launch.md"}),
-                "read_1",
+                "read_file", json.dumps({"path": hits[0]["path"]}), "read_1",
             )])
-        return completion(f"The launch code is {FACT}.")
+        content = tool_content({"body": _payload}, "read_1").get("content", "")
+        return completion(content or "No launch code received.")
 
     result, requests = run_task(
         binary, workspace, "What launch code is written in the notes?", respond,
     )
-    forwarded = json.dumps([r["body"] for r in requests])
+    search = tool_content(requests[1], "search_1") if len(requests) > 1 else {}
+    read = tool_content(requests[2], "read_1") if len(requests) > 2 else {}
     return score([
         ("completed", result.returncode == 0),
         ("answer_has_fact", FACT in result.stdout),
-        ("secret_not_in_answer", SECRET not in result.stdout),
-        ("read_was_forwarded", FACT in forwarded and "docs/notes/launch.md" in forwarded),
+        ("secret_not_in_transcript_or_output", no_secret(result, requests)),
+        ("search_found_note", search.get("matches") == [
+            {"path": "docs/notes/launch.md", "line": 1, "text": f"The launch code is {FACT}."}]),
+        ("read_was_forwarded", read.get("path") == "docs/notes/launch.md"
+         and read.get("content") == f"The launch code is {FACT}.\n"),
         ("three_model_rounds", len(requests) == 3),
     ])
 
@@ -173,11 +200,11 @@ def task_secret_file_stays_unread(binary, workspace):
         return completion("The credential file is not available.")
 
     result, requests = run_task(binary, workspace, "Read the env file.", respond)
-    tool = tool_messages(requests[1])[0]["content"] if len(requests) > 1 else ""
+    tool = tool_content(requests[1], "secret_read") if len(requests) > 1 else {}
     return score([
         ("completed", result.returncode == 0),
-        ("secret_not_in_answer", SECRET not in result.stdout),
-        ("denial_returned", "denied" in tool and SECRET not in tool),
+        ("secret_not_in_transcript_or_output", no_secret(result, requests)),
+        ("denial_returned", tool.get("error", {}).get("kind") == "denied"),
         ("two_model_rounds", len(requests) == 2),
     ])
 
@@ -194,7 +221,12 @@ def task_identical_calls_stop_before_eighth(binary, workspace):
     result, requests = run_task(
         binary, workspace, "Keep reading notes.txt.", respond,
     )
+    reads = [event["payload"] for event in result.trace
+             if event["kind"] == "tool_call" and event["payload"]["tool"] == "read_file"]
     return score([
+        ("seven_reads_executed", len(reads) == 7 and all(read["ok"] for read in reads)),
+        ("warnings_at_five_through_seven", [read["repeat_warning"] for read in reads]
+         == [False] * 4 + [True] * 3),
         ("budget_exit", result.returncode == 2),
         ("identical_call_stop", "repeated identical tool call" in result.stderr),
         ("eighth_call_not_followed_by_another_round", len(requests) == 8),
@@ -204,7 +236,7 @@ def task_identical_calls_stop_before_eighth(binary, workspace):
 def task_unknown_edit_tool_is_rejected(binary, workspace):
     target = workspace / "notes.txt"
     target.write_text("untouched\n")
-    before = target.read_text()
+    before = workspace_snapshot(workspace)
 
     def respond(index, _payload):
         if index == 0:
@@ -220,8 +252,8 @@ def task_unknown_edit_tool_is_rejected(binary, workspace):
         ("invalid_response", result.returncode == 4),
         ("named_in_stderr", "InvalidResponse" in result.stderr),
         ("no_second_round", len(requests) == 1),
-        ("file_unchanged", target.read_text() == before),
-        ("no_new_file", not (workspace / "edited.txt").exists()),
+        ("workspace_unchanged", workspace_snapshot(workspace) == before),
+        ("no_tool_executed", not any(event["kind"] == "tool_call" for event in result.trace)),
     ])
 
 
@@ -234,11 +266,11 @@ def task_text_only_sends_no_tools(binary, workspace):
     result, requests = run_task(
         binary, workspace, "Answer without tools.", respond, extra=("--text-only",),
     )
-    tools = requests[0]["body"].get("tools") if requests else ["missing"]
+    body = requests[0]["body"] if requests else {"tools": "missing"}
     return score([
         ("completed", result.returncode == 0),
         ("answer", "heldout-text-answer" in result.stdout),
-        ("no_tool_schema", tools is None),
+        ("no_tool_schema", "tools" not in body),
         ("one_round", len(requests) == 1),
     ])
 
@@ -261,6 +293,8 @@ def main():
         help="JSON score file (default: target/heldout-eval.json)",
     )
     args = parser.parse_args()
+    binary = Path(args.binary).resolve(strict=True)
+    binary_digest = hashlib.sha256(binary.read_bytes()).hexdigest()
     tasks = []
     with tempfile.TemporaryDirectory(prefix="min-agent-heldout-ws-") as tmp:
         workspace = Path(tmp)
@@ -269,7 +303,7 @@ def main():
             task_root = workspace / name
             task_root.mkdir()
             try:
-                outcome = fn(args.binary, task_root)
+                outcome = fn(str(binary), task_root)
                 outcome["error"] = None
             except Exception as exc:
                 outcome = {
@@ -284,7 +318,12 @@ def main():
             mark = "PASS" if outcome["ok"] else "FAIL"
             print(f"{mark} {name}", flush=True)
     report = {
-        "suite": "heldout-v1",
+        "suite": "heldout-v2",
+        "evaluation": "public scripted regression; not model capability or blind held-out accuracy",
+        "binary_sha256": binary_digest,
+        "suite_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "platform": platform.platform(),
+        "python": platform.python_version(),
         "points": sum(task["points"] for task in tasks),
         "max_points": sum(task["max_points"] for task in tasks),
         "tasks": tasks,
