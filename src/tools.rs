@@ -5,6 +5,8 @@ use cap_std::{ambient_authority, fs::Dir};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::{
+    cell::RefCell,
+    collections::HashMap,
     fmt,
     io::{self, Read, Seek, SeekFrom},
     path::{Component, Path, PathBuf},
@@ -706,6 +708,7 @@ fn char_end(bytes: &[u8], limit: usize) -> usize {
 #[derive(Debug)]
 pub struct SavedResults {
     dir: PathBuf,
+    files: RefCell<HashMap<String, std::fs::File>>,
 }
 
 #[derive(Debug)]
@@ -717,7 +720,10 @@ pub struct SavedRequest {
 
 impl SavedResults {
     pub fn new(dir: PathBuf) -> Self {
-        Self { dir }
+        Self {
+            dir,
+            files: RefCell::new(HashMap::new()),
+        }
     }
 
     pub fn dir(&self) -> &Path {
@@ -752,25 +758,45 @@ impl SavedResults {
     /// Writes the full tool text. The id is chosen by the agent (`r0`, `r1`, ...).
     pub fn save(&self, id: &str, text: &str) -> ToolResult<PathBuf> {
         let path = self.path(id)?;
-        std::fs::create_dir_all(&self.dir).map_err(|_| {
-            ToolError::new(
-                ToolErrorKind::Io,
-                "Could not create the tool-result directory",
-            )
-        })?;
-        write_private(&path, text.as_bytes())?;
+        let mut files = self.files.borrow_mut();
+        if files.is_empty() {
+            if let Some(parent) = self.dir.parent() {
+                std::fs::create_dir_all(parent).map_err(io_error)?;
+            }
+            // Refuse a pre-existing per-run directory, including symlinks.
+            let mut builder = std::fs::DirBuilder::new();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                builder.mode(0o700);
+            }
+            builder.create(&self.dir).map_err(io_error)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        // Exclusive creation refuses existing files, hard links, and symlinks.
+        let mut file = options.open(&path).map_err(io_error)?;
+        std::io::Write::write_all(&mut file, text.as_bytes()).map_err(io_error)?;
+        // Keep the opened file: later path replacement cannot redirect reads.
+        files.insert(id.to_string(), file);
         Ok(path)
     }
 
     /// One page of a previously saved tool result. Read-only.
-    pub fn read(&self, request: SavedRequest) -> ToolResult<ToolOutput> {
-        let path = self.path(&request.result_id)?;
-        let text = std::fs::read_to_string(&path).map_err(|error| match error.kind() {
-            io::ErrorKind::NotFound => {
-                ToolError::new(ToolErrorKind::NotFound, "Saved tool result not found")
-            }
-            _ => ToolError::new(ToolErrorKind::Io, "Could not read the saved tool result"),
+    pub fn read(&self, request: SavedRequest, output_limit: usize) -> ToolResult<ToolOutput> {
+        self.path(&request.result_id)?;
+        let mut files = self.files.borrow_mut();
+        let file = files.get_mut(&request.result_id).ok_or_else(|| {
+            ToolError::new(ToolErrorKind::NotFound, "Saved tool result not found")
         })?;
+        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
+        let mut text = String::new();
+        file.read_to_string(&mut text).map_err(io_error)?;
         if request.offset > text.len() {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
@@ -783,23 +809,47 @@ impl SavedResults {
                 "Read offset splits a character",
             ));
         }
-        let page = &text.as_bytes()[request.offset..];
-        let end = char_end(page, request.limit.min(page.len()));
-        let next = request.offset + end;
-        let truncated = next < text.len();
-        let content = json!({
-            "result_id": request.result_id,
-            "offset": request.offset,
-            "next_offset": next,
-            "total_bytes": text.len(),
-            "truncated": truncated,
-            "content": &text[request.offset..next],
-        })
-        .to_string();
+        let page = &text[request.offset..];
+        let boundary = |mut end: usize| {
+            while !page.is_char_boundary(end) {
+                end -= 1;
+            }
+            end
+        };
+        let render = |end: usize| {
+            let next = request.offset + end;
+            json!({
+                "result_id": request.result_id,
+                "offset": request.offset,
+                "next_offset": next,
+                "total_bytes": text.len(),
+                "truncated": next < text.len(),
+                "content": &page[..end],
+            })
+            .to_string()
+        };
+        // Fit the complete JSON envelope, including escaped content, into the cap.
+        let (mut lo, mut hi) = (0, char_end(page.as_bytes(), request.limit.min(page.len())));
+        while lo < hi {
+            let mid = (lo + hi).div_ceil(2);
+            if render(boundary(mid)).len() <= output_limit {
+                lo = mid;
+            } else {
+                hi = mid - 1;
+            }
+        }
+        let end = boundary(lo);
+        let content = render(end);
+        if content.len() > output_limit || (end == 0 && !page.is_empty()) {
+            return Err(ToolError::new(
+                ToolErrorKind::InvalidArguments,
+                "Tool output cap is too small for a saved-result page",
+            ));
+        }
         Ok(ToolOutput {
             content,
             full_text: None,
-            truncated,
+            truncated: request.offset + end < text.len(),
             redacted: 0,
         })
     }
@@ -813,21 +863,6 @@ impl SavedResults {
         }
         Ok(self.dir.join(format!("{id}.txt")))
     }
-}
-
-fn write_private(path: &Path, bytes: &[u8]) -> ToolResult<()> {
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create(true).truncate(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600);
-    }
-    let mut file = options
-        .open(path)
-        .map_err(|_| ToolError::new(ToolErrorKind::Io, "Could not save the full tool output"))?;
-    std::io::Write::write_all(&mut file, bytes)
-        .map_err(|_| ToolError::new(ToolErrorKind::Io, "Could not save the full tool output"))
 }
 
 /// Every offered tool is a read. `read_tool_result` reads only saved output, not the workspace.
@@ -1190,7 +1225,10 @@ mod tests {
         let text = "abcdefghij".repeat(1000);
         saved.save("r0", &text).unwrap();
         let page = saved
-            .read(SavedResults::prepare(json!({"result_id":"r0","limit":8})).unwrap())
+            .read(
+                SavedResults::prepare(json!({"result_id":"r0","limit":8})).unwrap(),
+                4096,
+            )
             .unwrap();
         let value: Value = serde_json::from_str(&page.content).unwrap();
         assert_eq!(value["content"], "abcdefgh");
@@ -1198,24 +1236,144 @@ mod tests {
         assert_eq!(value["truncated"], true);
         assert_eq!(value["total_bytes"], text.len());
         let rest = saved
-            .read(SavedResults::prepare(json!({"result_id":"r0","offset":text.len() - 4})).unwrap())
+            .read(
+                SavedResults::prepare(json!({"result_id":"r0","offset":text.len() - 4})).unwrap(),
+                4096,
+            )
             .unwrap();
         let rest: Value = serde_json::from_str(&rest.content).unwrap();
         assert_eq!(rest["truncated"], false);
         assert_eq!(rest["content"], &text[text.len() - 4..]);
         for bad in ["../r0", "r0.txt", "", "r0/x", "not-a-real-id"] {
             let error = saved
-                .read(SavedResults::prepare(json!({"result_id": bad})).unwrap())
+                .read(
+                    SavedResults::prepare(json!({"result_id": bad})).unwrap(),
+                    4096,
+                )
                 .err()
                 .unwrap();
             assert_eq!(error.kind, ToolErrorKind::InvalidArguments, "{bad}");
             assert!(!temp.path().join("r0").exists());
         }
         let missing = saved
-            .read(SavedResults::prepare(json!({"result_id":"r9"})).unwrap())
+            .read(
+                SavedResults::prepare(json!({"result_id":"r9"})).unwrap(),
+                4096,
+            )
             .err()
             .unwrap();
         assert_eq!(missing.kind, ToolErrorKind::NotFound);
+    }
+
+    #[test]
+    fn saved_results_reject_existing_directories_and_unissued_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("results");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("secret.txt"), "private").unwrap();
+        let saved = SavedResults::new(dir.clone());
+        let request = SavedResults::prepare(json!({"result_id":"secret"})).unwrap();
+        assert_eq!(
+            saved.read(request, 4096).unwrap_err().kind,
+            ToolErrorKind::NotFound
+        );
+        assert!(saved.save("secret", "overwrite").is_err());
+        assert_eq!(
+            std::fs::read_to_string(dir.join("secret.txt")).unwrap(),
+            "private"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_results_refuse_links_and_read_the_original_open_file() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, "private").unwrap();
+        let dir = temp.path().join("results");
+        let saved = SavedResults::new(dir.clone());
+        saved.save("r0", "original").unwrap();
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(dir.join("r0.txt"))
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        symlink(&victim, dir.join("r1.txt")).unwrap();
+        assert!(saved.save("r1", "overwrite").is_err());
+        std::fs::hard_link(&victim, dir.join("r2.txt")).unwrap();
+        assert!(saved.save("r2", "overwrite").is_err());
+        std::fs::remove_file(dir.join("r0.txt")).unwrap();
+        symlink(&victim, dir.join("r0.txt")).unwrap();
+        let page = saved
+            .read(
+                SavedResults::prepare(json!({"result_id":"r0"})).unwrap(),
+                4096,
+            )
+            .unwrap();
+        let page: Value = serde_json::from_str(&page.content).unwrap();
+        assert_eq!(page["content"], "original");
+        assert_eq!(std::fs::read_to_string(&victim).unwrap(), "private");
+        let other = SavedResults::new(temp.path().join("link"));
+        symlink(&dir, other.dir()).unwrap();
+        assert!(other.save("r3", "overwrite").is_err());
+        assert!(!dir.join("r3.txt").exists());
+    }
+
+    #[test]
+    fn saved_result_small_limits_complete_the_leading_utf8_character() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        saved.save("r0", "é𝄞").unwrap();
+        for (offset, expected, next) in [(0, "é", 2), (2, "𝄞", 6)] {
+            let output = saved
+                .read(
+                    SavedResults::prepare(json!({"result_id":"r0", "offset":offset, "limit":1}))
+                        .unwrap(),
+                    4096,
+                )
+                .unwrap();
+            assert!(output.content.len() <= 4096);
+            let page: Value = serde_json::from_str(&output.content).unwrap();
+            assert_eq!(page["content"], expected);
+            assert_eq!(page["next_offset"], next);
+        }
+    }
+
+    #[test]
+    fn saved_result_pages_fit_the_serialized_cap_and_make_utf8_progress() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        let text = "\0\"\\é𝄞".repeat(2000);
+        saved.save("r0", &text).unwrap();
+        let mut offset = 0;
+        let mut reconstructed = String::new();
+        loop {
+            let page = saved
+                .read(
+                    SavedResults::prepare(json!({"result_id":"r0", "offset":offset})).unwrap(),
+                    4096,
+                )
+                .unwrap();
+            assert!(page.content.len() <= 4096);
+            let page: Value = serde_json::from_str(&page.content).unwrap();
+            reconstructed.push_str(page["content"].as_str().unwrap());
+            let next = page["next_offset"].as_u64().unwrap() as usize;
+            assert!(next > offset);
+            assert!(text.is_char_boundary(next));
+            offset = next;
+            if page["truncated"] == false {
+                break;
+            }
+        }
+        assert_eq!(reconstructed, text);
     }
 
     #[test]
