@@ -4,10 +4,10 @@ use crate::{
     config::{proxy_url, Connection, ModelProfile, Protocol},
 };
 use anyhow::{Context, Result};
-use reqwest::{blocking::Client, header};
 use serde::Serialize;
 use serde_json::Value;
-use std::{fmt, io::Read, time::Duration};
+use std::{fmt, time::Duration};
+use ureq::http::{header, HeaderMap, HeaderName, HeaderValue};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCall {
@@ -144,7 +144,8 @@ pub trait ModelClient {
 
 /// HTTP model client for any configured protocol.
 pub struct HttpModelClient {
-    client: Client,
+    agent: ureq::Agent,
+    headers: HeaderMap,
     endpoint: url::Url,
     protocol: Protocol,
     profile: ModelProfile,
@@ -153,34 +154,33 @@ pub struct HttpModelClient {
 impl HttpModelClient {
     pub fn new(connection: &Connection, profile: &ModelProfile) -> Result<Self> {
         connection.validate()?;
-        let mut headers = header::HeaderMap::new();
+        let mut headers = HeaderMap::new();
         if let Some((name, secret)) = connection.auth.credential()? {
-            let name = header::HeaderName::from_bytes(name.as_bytes())
+            let name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| anyhow::anyhow!("Invalid credential header name"))?;
-            let mut value = header::HeaderValue::from_str(&secret)
+            let mut value = HeaderValue::from_str(&secret)
                 .map_err(|_| anyhow::anyhow!("Credential is not a valid HTTP header"))?;
             value.set_sensitive(true);
             headers.insert(name, value);
         }
         if connection.protocol == Protocol::AnthropicMessages {
-            headers.insert(
-                "anthropic-version",
-                header::HeaderValue::from_static("2023-06-01"),
-            );
+            headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
         }
-        // `no_proxy` clears ambient proxy discovery; an explicit proxy is added after.
-        let mut builder = Client::builder()
-            .default_headers(headers)
-            .redirect(reqwest::redirect::Policy::none())
-            .connect_timeout(Duration::from_secs(10))
-            .no_proxy();
+        // ureq's default config reads ALL_PROXY / HTTP(S)_PROXY. Replace that with none,
+        // then install only the explicit proxy from this connection.
+        let mut builder = ureq::Agent::config_builder()
+            .http_status_as_error(false)
+            .max_redirects(0)
+            .timeout_connect(Some(Duration::from_secs(10)))
+            .proxy(None);
         if let Some(proxy) = &connection.proxy {
-            let proxy = reqwest::Proxy::all(proxy_url(proxy)?.as_str())
+            let proxy = ureq::Proxy::new(proxy_url(proxy)?.as_str())
                 .context("Invalid proxy configuration")?;
-            builder = builder.proxy(proxy);
+            builder = builder.proxy(Some(proxy));
         }
         Ok(Self {
-            client: builder.build().context("Cannot construct HTTP client")?,
+            agent: builder.build().into(),
+            headers,
             endpoint: connection.endpoint()?,
             protocol: connection.protocol,
             profile: profile.clone(),
@@ -192,22 +192,21 @@ impl HttpModelClient {
         if bytes.len() > limits.max_request_bytes {
             return Err(ModelError::RequestTooLarge);
         }
-        let response = self
-            .client
-            .post(self.endpoint.clone())
-            .header(header::CONTENT_TYPE, "application/json")
-            .timeout(limits.timeout)
-            .body(bytes)
-            .send()
-            .map_err(|error| {
-                if error.is_timeout() {
-                    ProviderFailure::Timeout
-                } else if error.is_connect() {
-                    ProviderFailure::Connect
-                } else {
-                    ProviderFailure::Transport
-                }
-            })?;
+        let mut request = self
+            .agent
+            .post(self.endpoint.as_str())
+            .config()
+            .timeout_global(Some(limits.timeout))
+            .build();
+        if let Some(dest) = request.headers_mut() {
+            for (name, value) in &self.headers {
+                dest.insert(name.clone(), value.clone());
+            }
+        }
+        let response = request
+            .content_type("application/json")
+            .send(&bytes)
+            .map_err(classify_send)?;
         let status = response.status();
         if !status.is_success() {
             let retry_after = response
@@ -231,23 +230,20 @@ impl HttpModelClient {
             }
         }
         if response
+            .body()
             .content_length()
             .is_some_and(|len| len > limits.max_response_bytes as u64)
         {
             return Err(ProviderFailure::BodyTooLarge.into());
         }
         // Enforced while reading: a chunked body without Content-Length cannot exceed it.
-        let mut bytes = Vec::new();
-        response
-            .take(limits.max_response_bytes as u64 + 1)
-            .read_to_end(&mut bytes)
-            .map_err(|error| {
-                if read_timed_out(&error) {
-                    ProviderFailure::Timeout
-                } else {
-                    ProviderFailure::BodyRead
-                }
-            })?;
+        let cap = limits.max_response_bytes as u64 + 1;
+        let bytes = response
+            .into_body()
+            .into_with_config()
+            .limit(cap)
+            .read_to_vec()
+            .map_err(classify_body)?;
         if bytes.len() > limits.max_response_bytes {
             return Err(ProviderFailure::BodyTooLarge.into());
         }
@@ -255,25 +251,65 @@ impl HttpModelClient {
     }
 }
 
-/// Body reads surface the request deadline as an `io::Error` wrapping a reqwest timeout.
-fn read_timed_out(error: &std::io::Error) -> bool {
+fn classify_send(error: ureq::Error) -> ProviderFailure {
+    if is_timeout(&error) {
+        ProviderFailure::Timeout
+    } else if is_connect(&error) {
+        ProviderFailure::Connect
+    } else {
+        ProviderFailure::Transport
+    }
+}
+
+fn classify_body(error: ureq::Error) -> ProviderFailure {
+    if matches!(error, ureq::Error::BodyExceedsLimit(_)) {
+        ProviderFailure::BodyTooLarge
+    } else if is_timeout(&error) {
+        ProviderFailure::Timeout
+    } else {
+        ProviderFailure::BodyRead
+    }
+}
+
+fn is_timeout(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::Timeout(_) => true,
+        ureq::Error::Io(io) => io_timed_out(io),
+        _ => false,
+    }
+}
+
+fn io_timed_out(error: &std::io::Error) -> bool {
     if error.kind() == std::io::ErrorKind::TimedOut {
         return true;
     }
     let mut source: Option<&(dyn std::error::Error + 'static)> = error.get_ref().map(|e| e as _);
     while let Some(current) = source {
-        if current
-            .downcast_ref::<reqwest::Error>()
-            .is_some_and(reqwest::Error::is_timeout)
+        if matches!(current.downcast_ref::<ureq::Error>(), Some(inner) if is_timeout(inner))
             || current
                 .downcast_ref::<std::io::Error>()
-                .is_some_and(|e| e.kind() == std::io::ErrorKind::TimedOut)
+                .is_some_and(|inner| inner.kind() == std::io::ErrorKind::TimedOut)
         {
             return true;
         }
         source = current.source();
     }
     false
+}
+
+/// Connection failures that are not themselves timeouts. A connect timeout is `Timeout`,
+/// matching the previous client, which checked the deadline before the connect class.
+fn is_connect(error: &ureq::Error) -> bool {
+    match error {
+        ureq::Error::ConnectionFailed
+        | ureq::Error::HostNotFound
+        | ureq::Error::ConnectProxyFailed(_) => true,
+        ureq::Error::Io(io) => matches!(
+            io.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::AddrNotAvailable
+        ),
+        _ => false,
+    }
 }
 
 impl ModelClient for HttpModelClient {
