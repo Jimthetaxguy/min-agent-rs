@@ -174,9 +174,13 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked
 python3 tests/acceptance.py target/debug/min-agent
+python3 tests/heldout_eval.py target/debug/min-agent
 cargo deny check
 ./scripts/check-release-size.sh
 ```
+
+`tests/heldout_eval.py` scores a fixed fake-model set and writes
+`target/heldout-eval.json`. It exits non-zero if any point is lost.
 
 `scripts/check-release-size.sh` builds the locked release binary and fails if it is
 larger than 2,411,596 bytes (the measured release size plus about 10% headroom).
