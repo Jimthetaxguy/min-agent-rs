@@ -169,7 +169,8 @@ cargo deny check
 ```
 
 `scripts/check-release-size.sh` builds the locked release binary and fails if it is
-larger than 7,067,402 bytes. CI runs that check on Linux. The workflow also runs the
+larger than 2,411,596 bytes (the measured release size plus about 10% headroom).
+CI runs that check on Linux. The workflow also runs the
 checks above on Linux and macOS, plus an MSRV (1.88) check. It uses a
 read-only token, no secrets, and actions pinned by commit SHA, because fork pull requests
 execute build scripts from the dependency graph.

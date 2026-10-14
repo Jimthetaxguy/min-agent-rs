@@ -10,12 +10,10 @@ repository = "https://github.com/Jimthetaxguy/min-agent-rs"
 [dependencies]
 anyhow = { version = "1", default-features = false, features = ["std"] }
 cap-std = "3"
-# Explicit clap features are the user-facing CLI: help, usage, error context,
-# typo suggestions, and color. Defaults such as wrap_help are left off.
-clap = { version = "4", default-features = false, features = ["std", "derive", "help", "usage", "error-context", "suggestions", "color"] }
-# Already minimal: no native-tls, http2, http3, gzip, brotli, charset, or cookies.
-# rustls-tls is ring + webpki roots (no rustls logging feature). Verified with cargo tree.
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+# Blocking HTTP/1 client. rustls is ring + webpki roots; gzip, brotli, charset,
+# cookies, and native-tls stay off. No tokio or hyper. aws-lc-rs was measured
+# larger than ring (2,972,136 vs 2,192,360 bytes) and is not used.
+ureq = { version = "3", default-features = false, features = ["rustls"] }
 serde = { version = "1", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1", default-features = false, features = ["std"] }
 # Config is parsed only; the TOML display/serializer feature is unused.
@@ -27,13 +25,15 @@ tempfile = "3"
 
 # Release size budget: scripts/check-release-size.sh.
 # opt-level "z" measured smaller than "s" on x86_64-unknown-linux-gnu.
-# panic stays unwind. tokio's task harness catch_unwinds panics inside the
-# reqwest blocking runtime; abort would turn those into process aborts.
-# Transitive tokio features in use are io-util, net, rt, sync, and time
-# (current-thread). rt-multi-thread, fs, process, signal, and macros are off.
+# panic = abort is safe here: ureq does not use tokio, and nothing in the
+# linked graph catch_unwinds as control flow. once_cell (rustls, rustix)
+# only catches panics to poison lazy init, which abort turns into process exit.
+# Nightly flags were measured and are not enabled, so stable rustc still builds:
+# -Zlocation-detail=none was 2,127,760 bytes; panic = "immediate-abort" with
+# -Zbuild-std was 1,934,264. Neither is part of this profile.
 [profile.release]
 strip = true
 lto = true
 codegen-units = 1
 opt-level = "z"
-panic = "unwind"
+panic = "abort"
