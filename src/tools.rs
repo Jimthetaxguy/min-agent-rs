@@ -829,7 +829,7 @@ impl SavedResults {
             .to_string()
         };
         // Fit the complete JSON envelope, including escaped content, into the cap.
-        let (mut lo, mut hi) = (0, request.limit.min(page.len()));
+        let (mut lo, mut hi) = (0, char_end(page.as_bytes(), request.limit.min(page.len())));
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
             if render(boundary(mid)).len() <= output_limit {
@@ -1325,6 +1325,26 @@ mod tests {
         symlink(&dir, other.dir()).unwrap();
         assert!(other.save("r3", "overwrite").is_err());
         assert!(!dir.join("r3.txt").exists());
+    }
+
+    #[test]
+    fn saved_result_small_limits_complete_the_leading_utf8_character() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        saved.save("r0", "é𝄞").unwrap();
+        for (offset, expected, next) in [(0, "é", 2), (2, "𝄞", 6)] {
+            let output = saved
+                .read(
+                    SavedResults::prepare(json!({"result_id":"r0", "offset":offset, "limit":1}))
+                        .unwrap(),
+                    4096,
+                )
+                .unwrap();
+            assert!(output.content.len() <= 4096);
+            let page: Value = serde_json::from_str(&output.content).unwrap();
+            assert_eq!(page["content"], expected);
+            assert_eq!(page["next_offset"], next);
+        }
     }
 
     #[test]
