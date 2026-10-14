@@ -28,7 +28,7 @@ is offline and makes no model requests.
 | `--trace FILE` | Append a JSONL run trace (metadata only) to `FILE` |
 | `--report-json` | Print the full run report as JSON on stderr |
 | `--summary-dir DIR` | Write one `{run_id}.json` summary (model, settings, steps, tokens, tool outcomes). Default: `$TMPDIR/min-agent` |
-| `--result-dir DIR` | Where truncated tool output is saved for `read_tool_result`. Default: `$TMPDIR/min-agent/{run_id}` |
+| `--result-dir DIR` | Parent for private `{run_id}` directories holding truncated tool output. Default: `$TMPDIR/min-agent` |
 | `--max-rounds`, `--max-calls` | Override the round and tool-call budgets |
 | `--timeout-secs`, `--request-timeout-secs` | Override the run and per-request deadlines |
 | `--max-retries` | Retries of transient provider failures per round |
@@ -109,7 +109,7 @@ rather than failing. Whenever a result is truncated, the full tool text is saved
 outside the workspace. The model still receives the capped result, including fields
 such as `next_offset`, plus a `result_id`, and can page the saved text with
 `read_tool_result`. Paths in results are workspace-relative (`src/main.rs`, never
-`./src/main.rs`). Saved results live in the system temp directory, or in `--result-dir`.
+`./src/main.rs`). Saved results live in a private per-run directory under `$TMPDIR/min-agent`, or under `--result-dir`. Existing per-run directories and output files are refused; only IDs saved by the current run can be read.
 
 ## Filesystem and privacy boundaries
 

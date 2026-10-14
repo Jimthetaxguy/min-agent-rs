@@ -282,7 +282,7 @@ Ask a model, optionally using bounded read-only workspace tools
       {summary_dir} <DIR>
           Directory for this run's JSON summary (`{{run_id}}.json`). Default: `$TMPDIR/min-agent`
       {result_dir} <DIR>
-          Directory for full tool text saved when a result is truncated. Default: `$TMPDIR/min-agent/{{run_id}}`
+          Parent directory for private `{{run_id}}` tool-result directories. Default: `$TMPDIR/min-agent`
       {rounds} <MAX_ROUNDS>
       {calls} <MAX_CALLS>
       {timeout} <TIMEOUT_SECS>

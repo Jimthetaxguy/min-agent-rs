@@ -237,7 +237,7 @@ pub struct RunOptions {
     pub model: String,
     /// When set, one `{run_id}.json` summary is written here after the run.
     pub summary_dir: Option<PathBuf>,
-    /// Directory for full tool text saved on truncation. Default: a temp directory for this run.
+    /// Parent directory for private per-run tool text. Default: `$TMPDIR/min-agent`.
     pub result_dir: Option<PathBuf>,
 }
 
@@ -373,7 +373,7 @@ fn drive(
     let mut usage_known = true;
     let mut repeat_counts: HashMap<String, usize> = HashMap::new();
     let store = SavedResults::new(match &options.result_dir {
-        Some(dir) => dir.clone(),
+        Some(dir) => dir.join(&report.run_id),
         None => std::env::temp_dir().join("min-agent").join(&report.run_id),
     });
     for round in 0..budget.max_rounds {
@@ -689,7 +689,8 @@ fn perform_call(
         .map_or(env.deadline, |t| env.deadline.min(t));
     let (path, mut result) = match ready {
         Ready::Saved(parsed) => {
-            let result = parsed.and_then(|request| env.store.read(request));
+            let result = parsed
+                .and_then(|request| env.store.read(request, env.budget.max_tool_output_bytes));
             (None, result)
         }
         Ready::Workspace(parsed) => {
@@ -1490,7 +1491,7 @@ mod tests {
                 vec![call(
                     1,
                     "read_tool_result",
-                    json!({"result_id":"r0","offset":0,"limit":512}),
+                    json!({"result_id":"r0","offset":0}),
                 )],
                 "",
             )),
@@ -1510,7 +1511,8 @@ mod tests {
         assert_eq!(report.calls[0].result_id.as_deref(), Some("r0"));
         assert!(report.calls[0].truncated);
         assert!(report.calls[0].bytes <= 4_096);
-        let saved = std::fs::read_to_string(results.path().join("r0.txt")).unwrap();
+        let saved =
+            std::fs::read_to_string(results.path().join(&report.run_id).join("r0.txt")).unwrap();
         assert!(saved.len() > 4_096, "saved text is the full tool output");
         assert!(saved.matches("\\u0000").count() > 100);
         let preview = match &report.transcript[2] {
@@ -1529,6 +1531,7 @@ mod tests {
         assert!(page["content"].as_str().unwrap().contains("\\u0000"));
         assert_eq!(report.calls[1].tool, "read_tool_result");
         assert!(report.calls[1].ok);
+        assert!(report.calls[1].bytes <= 4096);
         assert!(report.calls[1].result_id.is_none());
         // The saved file is outside the workspace, and a foreign id is not a workspace read.
         assert!(!temp.path().join("r0.txt").exists());
