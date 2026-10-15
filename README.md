@@ -174,9 +174,19 @@ cargo clippy --locked --all-targets -- -D warnings
 cargo test --locked
 cargo build --locked
 python3 tests/acceptance.py target/debug/min-agent
+python3 tests/test_heldout_eval.py
+python3 tests/heldout_eval.py target/debug/min-agent
 cargo deny check
 ./scripts/check-release-size.sh
 ```
+
+`tests/heldout_eval.py` scores five public scripted regression tasks (`heldout-v2`)
+against a loopback fake model, independently of `acceptance.py`, and writes
+`target/heldout-eval.json` with the executable SHA-256 and runtime metadata.
+Each task earns one point only when every assertion passes. It exits non-zero
+if any point is lost. These fixtures test tool transport and policy; the score
+is not model capability or blind held-out accuracy. Each subprocess uses an
+isolated environment, working directory, and summary/result/trace paths.
 
 `scripts/check-release-size.sh` builds the locked release binary and fails if it is
 larger than 2,411,596 bytes (the measured release size plus about 10% headroom).

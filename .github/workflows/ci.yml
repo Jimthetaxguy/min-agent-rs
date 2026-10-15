@@ -41,6 +41,8 @@ jobs:
       - run: cargo test --locked
       - run: cargo build --locked
       - run: python3 tests/acceptance.py target/debug/min-agent
+      - run: python3 tests/test_heldout_eval.py
+      - run: python3 tests/heldout_eval.py target/debug/min-agent
 
   msrv:
     runs-on: ubuntu-latest
