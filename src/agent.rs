@@ -700,9 +700,10 @@ fn perform_call(
                 0
             };
             let result = parsed.and_then(|request| {
-                env.store.read(
+                env.store.read_with_deadline(
                     request,
                     env.budget.max_tool_output_bytes.saturating_sub(reserve),
+                    tool_deadline,
                 )
             });
             (None, result)
@@ -1551,6 +1552,28 @@ mod tests {
         assert!(report.calls[1].result_id.is_none());
         // The saved file is outside the workspace, and a foreign id is not a workspace read.
         assert!(!temp.path().join("r0.txt").exists());
+    }
+
+    #[test]
+    fn saved_result_calls_use_the_run_deadline() {
+        let (_temp, workspace) = workspace();
+        let results = tempfile::tempdir().unwrap();
+        let store = SavedResults::new(results.path().join("results"));
+        store.save("r0", "saved text").unwrap();
+        let budget = Budget::default();
+        let mut repeat_counts = HashMap::new();
+        let mut env = CallEnv {
+            workspace: &workspace,
+            store: &store,
+            budget: &budget,
+            deadline: Instant::now(),
+            repeat_counts: &mut repeat_counts,
+        };
+        let call = call(0, "read_tool_result", json!({"result_id":"r0"}));
+        let ready = Ready::Saved(SavedResults::prepare(call.arguments.clone()));
+        let done = perform_call(&mut env, &call, ready, 0).unwrap();
+        assert_eq!(done.result.unwrap_err().kind, ToolErrorKind::Deadline);
+        assert!(done.model_content.contains("deadline"));
     }
 
     #[test]

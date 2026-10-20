@@ -103,6 +103,14 @@ are listed below and are part of each tool's contract.
 | `search_text` | Literal search over redacted text, depth-first in name order: at most 20,000 entries, depth 8, 256 KiB per file, 16 MiB total; binary, unreadable, and hardlinked files are counted in `skipped_files` |
 | `read_tool_result` | Read-only page of a saved full tool result (`result_id`, byte `offset` / `limit`). It cannot read the workspace |
 
+Saved-result pages seek directly to the requested offset and read at most `limit + 3`
+bytes (at most 8,195 bytes), including UTF-8 lookahead, regardless of total result size.
+The agent checks the tool/run deadline before and after this read and JSON rendering.
+These checks are cooperative: a blocking filesystem syscall cannot be interrupted.
+Library callers can use `SavedResults::read_with_deadline`; `read` remains available
+without deadline checks. The saved length is fixed when issued; later appended bytes
+are excluded. Concurrent modification of existing saved bytes is unsupported.
+
 Every result reports truncation. Output that would exceed the tool-result cap is
 shortened to fit (a read page ends earlier; lists and searches return fewer items)
 rather than failing. Whenever a result is truncated, the full tool text is saved

@@ -52,7 +52,9 @@ live-model results, and `docs/provenance.md` for reuse decisions.
   run adds a row to `docs/compatibility.md`.
 
 - **Saved tool result**: When tool output is truncated, the full text is written outside the
-  workspace. `read_tool_result` pages that text. It is read-only and is not a workspace path.
+  workspace. `read_tool_result` pages that text through the issued handle and fixed saved
+  length, reading only the requested window plus at most 3 UTF-8 lookahead bytes. The agent
+  applies cooperative tool/run deadline checks. It is read-only and is not a workspace path.
 - **Run summary**: One JSON object per run (`{run_id}.json`) with model, settings, steps,
   tokens, and each tool call's outcome.
 

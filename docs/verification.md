@@ -1,5 +1,37 @@
 # min-agent verification
 
+## Bounded saved-result paging (2026-10-20)
+
+Verified by Codex on Apple Silicon macOS with Rust 1.98.1, based on main `b0249b6`.
+Commands ran sequentially with `CARGO_TARGET_DIR=target` and `CARGO_BUILD_JOBS=2`.
+HTTP tests used synthetic loopback servers; no live provider or user credential was used.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo check --locked --offline --all-targets` | Passed |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | Passed |
+| `cargo test --locked --offline -- --test-threads=1` | 63 library, 2 CLI, 9 HTTP tests passed; 1 live test ignored |
+| `cargo build --locked --offline` | Passed |
+| `python3 tests/acceptance.py target/debug/min-agent` | 25/25 passed |
+| `python3 tests/test_heldout_eval.py` | 10/10 passed |
+| `python3 tests/heldout_eval.py target/debug/min-agent` | 5/5 scripted regression tasks passed; not a model-capability evaluation |
+| `cargo +1.88.0 check --locked --offline --all-targets` | Passed (MSRV) |
+| `cargo deny --locked --offline check advisories bans licenses sources` | Passed against the cached advisory database; existing duplicate `windows-sys` and yanked `yoke-derive` warnings remain |
+| `CARGO_NET_OFFLINE=true ./scripts/check-release-size.sh` | Passed: 1,685,136 bytes on aarch64-apple-darwin, below 2,411,596; Linux size not measured locally |
+
+Six new tests cover bounded reads, fixed issued lengths, UTF-8 offsets/lookahead,
+shortened/corrupt content, cooperative deadlines, and agent deadline wiring. Existing
+tests still cover escaped JSON caps, repeat-warning offsets, unissued IDs, and retained
+handles after path replacement. An independent diff review found no production defects;
+its suggestion to prove the post-read deadline check was incorporated into the test.
+
+The counted reader measures 8,195 bytes read for an 8,192-byte page at a 48 MiB offset
+in a simulated 64 MiB result, and zero bytes at EOF. This verifies the I/O bound;
+end-to-end latency, resident memory, and model efficiency were not benchmarked.
+Deadlines are cooperative and cannot interrupt a blocking filesystem syscall.
+Concurrent mutation of existing saved bytes remains unsupported.
+
 ## Read-only agent, complete (0.2.0)
 
 Verified on September 18, 2026 on Apple Silicon macOS, Rust 1.98.1, from the repository root.
