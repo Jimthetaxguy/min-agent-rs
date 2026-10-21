@@ -1,5 +1,11 @@
 # min-agent verification
 
+## Redaction scanner scaling (2026-10-21)
+
+See [redaction-scaling.md](redaction-scaling.md) for the source lesson, exact
+masking-equivalence coverage, baseline/final timings, and validation against the
+completed runtime-reliability head `87c5e97`.
+
 ## Atomic summary publication (2026-10-21)
 
 Verified by Codex on Apple Silicon macOS with Rust 1.98.1, preserving commits
