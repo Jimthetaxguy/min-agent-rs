@@ -708,7 +708,14 @@ fn char_end(bytes: &[u8], limit: usize) -> usize {
 #[derive(Debug)]
 pub struct SavedResults {
     dir: PathBuf,
-    files: RefCell<HashMap<String, std::fs::File>>,
+    files: RefCell<HashMap<String, SavedFile>>,
+}
+
+#[derive(Debug)]
+struct SavedFile {
+    file: std::fs::File,
+    // Retain the issued extent, so appended bytes cannot enlarge a saved result.
+    len: usize,
 }
 
 #[derive(Debug)]
@@ -783,33 +790,51 @@ impl SavedResults {
         let mut file = options.open(&path).map_err(io_error)?;
         std::io::Write::write_all(&mut file, text.as_bytes()).map_err(io_error)?;
         // Keep the opened file: later path replacement cannot redirect reads.
-        files.insert(id.to_string(), file);
+        files.insert(
+            id.to_string(),
+            SavedFile {
+                file,
+                len: text.len(),
+            },
+        );
         Ok(path)
     }
 
     /// One page of a previously saved tool result. Read-only.
     pub fn read(&self, request: SavedRequest, output_limit: usize) -> ToolResult<ToolOutput> {
+        self.read_inner(request, output_limit, None)
+    }
+
+    /// Bounded paging with cooperative deadline checks before and after file I/O
+    /// and rendering. A blocking filesystem syscall cannot be interrupted.
+    pub fn read_with_deadline(
+        &self,
+        request: SavedRequest,
+        output_limit: usize,
+        deadline: Instant,
+    ) -> ToolResult<ToolOutput> {
+        self.read_inner(request, output_limit, Some(deadline))
+    }
+
+    fn read_inner(
+        &self,
+        request: SavedRequest,
+        output_limit: usize,
+        deadline: Option<Instant>,
+    ) -> ToolResult<ToolOutput> {
+        check_saved_deadline(deadline)?;
         self.path(&request.result_id)?;
         let mut files = self.files.borrow_mut();
-        let file = files.get_mut(&request.result_id).ok_or_else(|| {
+        let saved = files.get_mut(&request.result_id).ok_or_else(|| {
             ToolError::new(ToolErrorKind::NotFound, "Saved tool result not found")
         })?;
-        file.seek(SeekFrom::Start(0)).map_err(io_error)?;
-        let mut text = String::new();
-        file.read_to_string(&mut text).map_err(io_error)?;
-        if request.offset > text.len() {
-            return Err(ToolError::new(
-                ToolErrorKind::InvalidArguments,
-                "Read offset exceeds result length",
-            ));
-        }
-        if !text.is_char_boundary(request.offset) {
-            return Err(ToolError::new(
-                ToolErrorKind::InvalidArguments,
-                "Read offset splits a character",
-            ));
-        }
-        let page = &text[request.offset..];
+        let page = saved_window(
+            &mut saved.file,
+            saved.len,
+            request.offset,
+            request.limit,
+            deadline,
+        )?;
         let boundary = |mut end: usize| {
             while !page.is_char_boundary(end) {
                 end -= 1;
@@ -822,14 +847,14 @@ impl SavedResults {
                 "result_id": request.result_id,
                 "offset": request.offset,
                 "next_offset": next,
-                "total_bytes": text.len(),
-                "truncated": next < text.len(),
+                "total_bytes": saved.len,
+                "truncated": next < saved.len,
                 "content": &page[..end],
             })
             .to_string()
         };
         // Fit the complete JSON envelope, including escaped content, into the cap.
-        let (mut lo, mut hi) = (0, char_end(page.as_bytes(), request.limit.min(page.len())));
+        let (mut lo, mut hi) = (0, page.len());
         while lo < hi {
             let mid = (lo + hi).div_ceil(2);
             if render(boundary(mid)).len() <= output_limit {
@@ -840,6 +865,7 @@ impl SavedResults {
         }
         let end = boundary(lo);
         let content = render(end);
+        check_saved_deadline(deadline)?;
         if content.len() > output_limit || (end == 0 && !page.is_empty()) {
             return Err(ToolError::new(
                 ToolErrorKind::InvalidArguments,
@@ -849,7 +875,7 @@ impl SavedResults {
         Ok(ToolOutput {
             content,
             full_text: None,
-            truncated: request.offset + end < text.len(),
+            truncated: request.offset + end < saved.len,
             redacted: 0,
         })
     }
@@ -863,6 +889,44 @@ impl SavedResults {
         }
         Ok(self.dir.join(format!("{id}.txt")))
     }
+}
+
+fn check_saved_deadline(deadline: Option<Instant>) -> ToolResult<()> {
+    deadline.map_or(Ok(()), check_deadline)
+}
+
+/// Read only the requested window, plus at most three bytes to finish a UTF-8
+/// character. The lookahead can end inside a later character; decode only the page.
+fn saved_window(
+    file: &mut (impl Read + Seek),
+    total_bytes: usize,
+    offset: usize,
+    limit: usize,
+    deadline: Option<Instant>,
+) -> ToolResult<String> {
+    check_saved_deadline(deadline)?;
+    if offset > total_bytes {
+        return Err(ToolError::new(
+            ToolErrorKind::InvalidArguments,
+            "Read offset exceeds result length",
+        ));
+    }
+    let position = u64::try_from(offset)
+        .map_err(|_| ToolError::new(ToolErrorKind::InvalidArguments, "Read offset is too large"))?;
+    file.seek(SeekFrom::Start(position)).map_err(io_error)?;
+    let mut bytes = vec![0; limit.saturating_add(3).min(total_bytes - offset)];
+    file.read_exact(&mut bytes).map_err(io_error)?;
+    check_saved_deadline(deadline)?;
+    if bytes.first().is_some_and(|b| is_continuation(*b)) {
+        return Err(ToolError::new(
+            ToolErrorKind::InvalidArguments,
+            "Read offset splits a character",
+        ));
+    }
+    let end = char_end(&bytes, limit);
+    bytes.truncate(end);
+    String::from_utf8(bytes)
+        .map_err(|_| ToolError::new(ToolErrorKind::Io, "Saved tool result is not valid UTF-8"))
 }
 
 /// Every offered tool is a read. `read_tool_result` reads only saved output, not the workspace.
@@ -1266,6 +1330,194 @@ mod tests {
     }
 
     #[test]
+    fn saved_pages_remain_within_the_issued_text() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        let path = saved.save("r0", "issued").unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, b" appended").unwrap();
+        let output = saved
+            .read(
+                SavedResults::prepare(json!({"result_id":"r0"})).unwrap(),
+                4096,
+            )
+            .unwrap();
+        let page: Value = serde_json::from_str(&output.content).unwrap();
+        assert_eq!(page["content"], "issued");
+        assert_eq!(page["total_bytes"], 6);
+        assert_eq!(page["next_offset"], 6);
+        assert_eq!(page["truncated"], false);
+        let request = SavedResults::prepare(json!({"result_id":"r0", "offset":7})).unwrap();
+        assert_eq!(
+            saved.read(request, 4096).unwrap_err().kind,
+            ToolErrorKind::InvalidArguments
+        );
+    }
+
+    #[test]
+    fn saved_window_reads_only_the_requested_bytes_and_utf8_lookahead() {
+        struct CountedFile {
+            len: u64,
+            position: u64,
+            read_bytes: usize,
+            seeks: Vec<u64>,
+        }
+        impl Read for CountedFile {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                let count = buf.len().min((self.len - self.position) as usize);
+                buf[..count].fill(b'x');
+                self.read_bytes += count;
+                self.position += count as u64;
+                Ok(count)
+            }
+        }
+        impl Seek for CountedFile {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                let SeekFrom::Start(offset) = position else {
+                    panic!("paging must seek directly to the requested offset");
+                };
+                self.position = offset;
+                self.seeks.push(offset);
+                Ok(offset)
+            }
+        }
+        let mut file = CountedFile {
+            len: 64 * 1024 * 1024,
+            position: 0,
+            read_bytes: 0,
+            seeks: vec![],
+        };
+        let total = 64 * 1024 * 1024;
+        let offset = 48 * 1024 * 1024;
+        let page = saved_window(&mut file, total, offset, READ_LIMIT, None).unwrap();
+        assert_eq!(page, "x".repeat(READ_LIMIT));
+        assert_eq!(file.read_bytes, READ_LIMIT + 3);
+        assert_eq!(file.seeks, vec![offset as u64]);
+        assert_eq!(file.position, (offset + READ_LIMIT + 3) as u64);
+
+        let page = saved_window(&mut file, total, total, READ_LIMIT, None).unwrap();
+        assert!(page.is_empty());
+        assert_eq!(file.read_bytes, READ_LIMIT + 3, "EOF reads no bytes");
+        assert_eq!(
+            saved_window(&mut file, total, total + 1, READ_LIMIT, None)
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::InvalidArguments
+        );
+        assert_eq!(file.read_bytes, READ_LIMIT + 3);
+    }
+
+    #[test]
+    fn saved_page_offsets_and_lookahead_preserve_utf8() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        let text = "a𝄞é€𝄞";
+        saved.save("r0", text).unwrap();
+        for offset in 0..=text.len() + 1 {
+            for limit in 1..=8 {
+                let result = saved.read(
+                    SavedResults::prepare(
+                        json!({"result_id":"r0", "offset":offset, "limit":limit}),
+                    )
+                    .unwrap(),
+                    4096,
+                );
+                if !text.is_char_boundary(offset) {
+                    assert_eq!(result.unwrap_err().kind, ToolErrorKind::InvalidArguments);
+                    continue;
+                }
+                let output = result.unwrap();
+                let page: Value = serde_json::from_str(&output.content).unwrap();
+                let remaining = &text[offset..];
+                let end = char_end(remaining.as_bytes(), limit);
+                assert_eq!(page["content"], &remaining[..end]);
+                assert_eq!(page["next_offset"], offset + end);
+                assert_eq!(page["total_bytes"], text.len());
+                assert_eq!(page["truncated"], offset + end < text.len());
+            }
+        }
+        let request = SavedResults::prepare(json!({"result_id":"r0"})).unwrap();
+        assert_eq!(
+            saved.read(request, 1).unwrap_err().kind,
+            ToolErrorKind::InvalidArguments
+        );
+    }
+
+    #[test]
+    fn saved_pages_reject_shortened_or_corrupted_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        let path = saved.save("r0", "original").unwrap();
+        for bytes in [b"short".as_slice(), &[0xff; 8]] {
+            std::fs::write(&path, bytes).unwrap();
+            let request = SavedResults::prepare(json!({"result_id":"r0"})).unwrap();
+            assert_eq!(
+                saved.read(request, 4096).unwrap_err().kind,
+                ToolErrorKind::Io
+            );
+        }
+    }
+
+    #[test]
+    fn saved_page_deadlines_are_checked_before_and_after_reading() {
+        let temp = tempfile::tempdir().unwrap();
+        let saved = SavedResults::new(temp.path().join("results"));
+        saved.save("r0", "original").unwrap();
+        let request = SavedResults::prepare(json!({"result_id":"r0"})).unwrap();
+        assert_eq!(
+            saved
+                .read_with_deadline(request, 4096, Instant::now())
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::Deadline
+        );
+        // Saving left the cursor at EOF. An already expired call must not seek.
+        assert_eq!(
+            saved
+                .files
+                .borrow_mut()
+                .get_mut("r0")
+                .unwrap()
+                .file
+                .stream_position()
+                .unwrap(),
+            8
+        );
+
+        struct SlowFile {
+            file: io::Cursor<Vec<u8>>,
+            deadline: Instant,
+        }
+        impl Read for SlowFile {
+            fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+                std::thread::sleep(self.deadline.saturating_duration_since(Instant::now()));
+                self.file.read(buf)
+            }
+        }
+        impl Seek for SlowFile {
+            fn seek(&mut self, position: SeekFrom) -> io::Result<u64> {
+                self.file.seek(position)
+            }
+        }
+        let deadline = Instant::now() + Duration::from_millis(100);
+        let mut file = SlowFile {
+            file: io::Cursor::new(b"page".to_vec()),
+            deadline,
+        };
+        assert_eq!(
+            saved_window(&mut file, 4, 0, 4, Some(deadline))
+                .unwrap_err()
+                .kind,
+            ToolErrorKind::Deadline
+        );
+        assert_eq!(
+            file.file.position(),
+            4,
+            "must exercise the post-read deadline check"
+        );
+    }
+
+    #[test]
     fn saved_results_reject_existing_directories_and_unissued_files() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("results");
@@ -1331,8 +1583,8 @@ mod tests {
     fn saved_result_small_limits_complete_the_leading_utf8_character() {
         let temp = tempfile::tempdir().unwrap();
         let saved = SavedResults::new(temp.path().join("results"));
-        saved.save("r0", "é𝄞").unwrap();
-        for (offset, expected, next) in [(0, "é", 2), (2, "𝄞", 6)] {
+        saved.save("r0", "é€𝄞").unwrap();
+        for (offset, expected, next) in [(0, "é", 2), (2, "€", 5), (5, "𝄞", 9)] {
             let output = saved
                 .read(
                     SavedResults::prepare(json!({"result_id":"r0", "offset":offset, "limit":1}))

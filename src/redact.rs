@@ -11,11 +11,23 @@ pub const MARK: &str = "[REDACTED]";
 /// Byte ranges of recognizable credentials in `bytes`, sorted and non-overlapping.
 pub fn find(bytes: &[u8]) -> Vec<Range<usize>> {
     let mut ranges = pem_blocks(bytes);
+    let pem_count = ranges.len();
+    let mut pem_index = 0;
     let mut i = 0;
     while i < bytes.len() {
-        if let Some(r) = ranges.iter().find(|r| r.contains(&i)) {
-            i = r.end;
-            continue;
+        // PEM blocks are ordered and disjoint. Tokens already advance `i` past
+        // themselves, so only the original PEM prefix needs a forward cursor.
+        if pem_index < pem_count {
+            let range = &ranges[pem_index];
+            if range.end <= i {
+                pem_index += 1;
+                continue;
+            }
+            if range.contains(&i) {
+                i = range.end;
+                pem_index += 1;
+                continue;
+            }
         }
         // Token prefixes only count at a word start, so `mask-...` is not `sk-...`.
         let boundary = i == 0 || !is_token_byte(bytes[i - 1]);
@@ -144,6 +156,108 @@ fn pem_blocks(bytes: &[u8]) -> Vec<Range<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Frozen scanner from 87c5e97: compare range selection, not just marker counts.
+    // Recognition helpers are unchanged by the scanner optimization.
+    fn legacy_find(bytes: &[u8]) -> Vec<Range<usize>> {
+        let mut ranges = pem_blocks(bytes);
+        let mut i = 0;
+        while i < bytes.len() {
+            if let Some(r) = ranges.iter().find(|r| r.contains(&i)) {
+                i = r.end;
+                continue;
+            }
+            let boundary = i == 0 || !is_token_byte(bytes[i - 1]);
+            if boundary {
+                if let Some(len) = token_len(&bytes[i..]) {
+                    ranges.push(i..i + len);
+                    i += len;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        ranges.sort_by_key(|r| r.start);
+        ranges
+    }
+
+    #[test]
+    fn dense_tokens_and_pem_blocks_keep_individual_masks() {
+        let token = format!("sk-{}", "x".repeat(24));
+        let pem = "-----BEGIN PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----";
+        let text = format!("héllo {token}\n{pem}\n{token} ✓\n").repeat(256);
+        assert_eq!(
+            redact(&text),
+            (
+                "héllo [REDACTED]\n[REDACTED]\n[REDACTED] ✓\n".repeat(256),
+                768,
+            )
+        );
+    }
+
+    #[test]
+    fn scanner_matches_legacy_ranges_and_window_masks_on_adversarial_inputs() {
+        let fragments: Vec<Vec<u8>> = vec![
+            b" ".to_vec(),
+            b"\n".to_vec(),
+            b"\0\xff".to_vec(),
+            "héllo ✓".as_bytes().to_vec(),
+            b"word".to_vec(),
+            b"mask-learning-rate".to_vec(),
+            b"sk-short".to_vec(),
+            format!("sk-{}", "x".repeat(24)).into_bytes(),
+            format!("ghp_{}", "a".repeat(36)).into_bytes(),
+            b"AKIAABCDEFGHIJKLMNOP".to_vec(),
+            b"AKIAabcdefghijklmnop".to_vec(),
+            b"-----BEGIN PRIVATE KEY-----\nbody\n-----END PRIVATE KEY-----".to_vec(),
+            b"-----BEGIN EC PRIVATE KEY-----\nbody\n-----END EC PRIVATE KEY-----".to_vec(),
+            b"-----BEGIN CERTIFICATE-----\nbody\n-----END CERTIFICATE-----".to_vec(),
+            b"-----BEGIN PRIVATE KEY-----\nunterminated".to_vec(),
+            b"-----BEGIN not a key".to_vec(),
+            b"-----END PRIVATE KEY-----".to_vec(),
+        ];
+
+        // Every pair catches adjacent tokens, token/PEM overlap, multiple PEMs,
+        // and malformed or unterminated PEMs without relying on random coverage.
+        let mut cases = Vec::new();
+        for left in &fragments {
+            for right in &fragments {
+                cases.push([left.as_slice(), right.as_slice()].concat());
+            }
+        }
+        // Longer deterministic mixtures exercise the cursor after many regions.
+        let mut seed = 0x5eed_u64;
+        for _ in 0..128 {
+            let mut bytes = Vec::new();
+            for _ in 0..24 {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                bytes.extend_from_slice(&fragments[(seed >> 32) as usize % fragments.len()]);
+            }
+            cases.push(bytes);
+        }
+        for (case, bytes) in cases.iter().enumerate() {
+            let expected = legacy_find(bytes);
+            assert_eq!(find(bytes), expected, "range mismatch in case {case}");
+            // Include empty windows and offsets inside/beside every range.
+            let mut windows = vec![0..0, 0..bytes.len(), bytes.len()..bytes.len()];
+            for range in &expected {
+                windows.extend([
+                    range.start..range.start,
+                    range.end..range.end,
+                    range.start.saturating_sub(1)..(range.end + 1).min(bytes.len()),
+                    (range.start + 1).min(range.end)..range.end,
+                    range.start..range.end.saturating_sub(1).max(range.start),
+                ]);
+            }
+            for window in windows {
+                assert_eq!(
+                    redact_window(bytes, window.clone()),
+                    apply(bytes, &expected, window.clone()),
+                    "mask mismatch in case {case}, window {window:?}",
+                );
+            }
+        }
+    }
 
     #[test]
     fn redacts_known_formats() {

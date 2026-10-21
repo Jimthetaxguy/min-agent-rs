@@ -199,6 +199,32 @@ pub struct RepeatStop {
     pub count: usize,
 }
 
+/// Summary persistence is optional metadata: its failure does not replace the
+/// execution outcome. Stages are recorded without OS messages or host paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryError {
+    InvalidRunId,
+    Encode,
+    CreateDirectory,
+    CreateFile,
+    WriteFile,
+}
+
+impl fmt::Display for SummaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidRunId => "run ID is not a single path segment",
+            Self::Encode => "cannot encode run summary",
+            Self::CreateDirectory => "cannot create summary directory",
+            Self::CreateFile => "cannot exclusively create summary file",
+            Self::WriteFile => "cannot write summary file",
+        })
+    }
+}
+
+impl std::error::Error for SummaryError {}
+
 #[derive(Debug, Serialize)]
 pub struct RunReport {
     pub run_id: String,
@@ -220,8 +246,11 @@ pub struct RunReport {
     pub usage: Usage,
     pub elapsed_ms: u64,
     pub calls: Vec<CallRecord>,
-    /// Written when a summary directory was requested.
+    /// Set only after a requested summary was successfully written.
     pub summary_path: Option<PathBuf>,
+    /// A requested summary failed to persist; the original stop and answer survive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_error: Option<SummaryError>,
     /// Full conversation; content, so excluded from serialized reports.
     #[serde(skip)]
     pub transcript: Vec<Item>,
@@ -235,7 +264,8 @@ pub struct RunOptions {
     pub meta: Value,
     /// Model id recorded on the report and the per-run summary. Empty when the caller omits it.
     pub model: String,
-    /// When set, one `{run_id}.json` summary is written here after the run.
+    /// When set, attempt to write one `{run_id}.json` summary after the run.
+    /// Persistence failure is returned on `RunReport::summary_error`, not as `Err`.
     pub summary_dir: Option<PathBuf>,
     /// Parent directory for private per-run tool text. Default: `$TMPDIR/min-agent`.
     pub result_dir: Option<PathBuf>,
@@ -298,6 +328,7 @@ pub fn run(
         elapsed_ms: 0,
         calls: Vec::new(),
         summary_path: None,
+        summary_error: None,
         transcript: vec![Item::User(prompt.to_string())],
     };
     trace.emit(
@@ -349,7 +380,10 @@ pub fn run(
         report.answer = None;
     }
     if let Some(dir) = &options.summary_dir {
-        report.summary_path = Some(write_run_summary(&report, dir)?);
+        match write_run_summary(&report, dir) {
+            Ok(path) => report.summary_path = Some(path),
+            Err(error) => report.summary_error = Some(error),
+        }
     }
     Ok(report)
 }
@@ -700,9 +734,10 @@ fn perform_call(
                 0
             };
             let result = parsed.and_then(|request| {
-                env.store.read(
+                env.store.read_with_deadline(
                     request,
                     env.budget.max_tool_output_bytes.saturating_sub(reserve),
+                    tool_deadline,
                 )
             });
             (None, result)
@@ -853,13 +888,11 @@ fn call_outcome(call: &CallRecord) -> String {
     }
 }
 
-fn write_run_summary(report: &RunReport, dir: &Path) -> Result<PathBuf> {
-    use anyhow::Context;
-    ensure!(
-        !report.run_id.is_empty() && !report.run_id.contains(['/', '\\']),
-        "run id is not a single path segment"
-    );
-    std::fs::create_dir_all(dir).context("Cannot create summary directory")?;
+fn write_run_summary(report: &RunReport, dir: &Path) -> Result<PathBuf, SummaryError> {
+    use std::io::Write;
+    if report.run_id.is_empty() || report.run_id.contains(['/', '\\']) {
+        return Err(SummaryError::InvalidRunId);
+    }
     let path = dir.join(format!("{}.json", report.run_id));
     let tool_calls: Vec<Value> = report
         .calls
@@ -884,10 +917,55 @@ fn write_run_summary(report: &RunReport, dir: &Path) -> Result<PathBuf> {
         "repeat_stop": report.repeat_stop,
         "tool_calls": tool_calls,
     });
-    let mut bytes = serde_json::to_vec_pretty(&summary).context("Cannot encode run summary")?;
+    let mut bytes = serde_json::to_vec_pretty(&summary).map_err(|_| SummaryError::Encode)?;
     bytes.push(b'\n');
-    std::fs::write(&path, bytes).with_context(|| format!("Cannot write {}", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|_| SummaryError::CreateDirectory)?;
+    publish_summary(&path, |file| file.write_all(&bytes))?;
     Ok(path)
+}
+
+/// Only armed after exclusive creation. Close before unlinking for portability;
+/// never remove the destination or a pre-existing staging file.
+struct PendingSummary {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl Drop for PendingSummary {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        // Cleanup cannot undo a successful publication. A cleanup failure or
+        // process crash may leave a .tmp file, never a partial final summary.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Final-name visibility is atomic on filesystems supporting hard links. Neither
+/// name is synced for power-loss durability. Requires a stable summary directory.
+fn publish_summary(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SummaryError> {
+    let staging = path.with_extension("json.tmp");
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&staging)
+        .map_err(|_| SummaryError::CreateFile)?;
+    let mut pending = PendingSummary {
+        path: staging,
+        file: Some(file),
+    };
+    let written = write(pending.file.as_mut().expect("newly created staging file"));
+    // Windows and other platforms may restrict linking/unlinking an open file.
+    // Close on both the success and failure paths before guard cleanup.
+    drop(pending.file.take());
+    written.map_err(|_| SummaryError::WriteFile)?;
+    // Same-directory hard-link creation never replaces an existing destination,
+    // including a dangling symlink. Do not fall back to copy or overwrite-rename.
+    std::fs::hard_link(&pending.path, path).map_err(|_| SummaryError::CreateFile)?;
+    // Drop owns only staging; the published name remains even if cleanup fails.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1554,6 +1632,28 @@ mod tests {
     }
 
     #[test]
+    fn saved_result_calls_use_the_run_deadline() {
+        let (_temp, workspace) = workspace();
+        let results = tempfile::tempdir().unwrap();
+        let store = SavedResults::new(results.path().join("results"));
+        store.save("r0", "saved text").unwrap();
+        let budget = Budget::default();
+        let mut repeat_counts = HashMap::new();
+        let mut env = CallEnv {
+            workspace: &workspace,
+            store: &store,
+            budget: &budget,
+            deadline: Instant::now(),
+            repeat_counts: &mut repeat_counts,
+        };
+        let call = call(0, "read_tool_result", json!({"result_id":"r0"}));
+        let ready = Ready::Saved(SavedResults::prepare(call.arguments.clone()));
+        let done = perform_call(&mut env, &call, ready, 0).unwrap();
+        assert_eq!(done.result.unwrap_err().kind, ToolErrorKind::Deadline);
+        assert!(done.model_content.contains("deadline"));
+    }
+
+    #[test]
     fn repeated_saved_pages_keep_offsets_consistent_with_warning_content() {
         let (temp, w) = workspace();
         std::fs::write(temp.path().join("nul.bin"), vec![0u8; 8192]).unwrap();
@@ -1603,6 +1703,287 @@ mod tests {
     }
 
     #[test]
+    fn summary_publication_is_invisible_until_the_write_completes() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let bytes = b"{\"stop\":{\"kind\":\"completed\"}}\n";
+        publish_summary(&path, |file| {
+            file.write_all(&bytes[..8])?;
+            assert!(!path.try_exists().unwrap(), "no partial final summary");
+            file.write_all(&bytes[8..])?;
+            assert!(
+                !path.try_exists().unwrap(),
+                "publish only after writer returns"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["stop"]["kind"], "completed");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn summary_partial_write_failure_cleans_only_the_owned_staging_file() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let user_file = temp.path().join("user.json.tmp");
+        std::fs::write(&user_file, "keep user data").unwrap();
+        let error = publish_summary(&path, |file| {
+            file.write_all(b"{\"unfinished\":")?;
+            assert!(!path.try_exists().unwrap());
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error, SummaryError::WriteFile);
+        assert!(!path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            std::fs::read_to_string(user_file).unwrap(),
+            "keep user data"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn summary_preexisting_staging_file_is_never_deleted_or_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let staging = path.with_extension("json.tmp");
+        std::fs::write(&staging, "pre-existing data").unwrap();
+        let error =
+            publish_summary(&path, |_| panic!("must not write existing staging file")).unwrap_err();
+        assert_eq!(error, SummaryError::CreateFile);
+        assert_eq!(
+            std::fs::read_to_string(staging).unwrap(),
+            "pre-existing data"
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn summary_publication_refuses_a_destination_created_during_the_write() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let error = publish_summary(&path, |file| {
+            file.write_all(b"{\"new\":true}")?;
+            std::fs::write(&path, "winning summary")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error, SummaryError::CreateFile);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "winning summary");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summary_publication_refuses_dangling_and_staging_symlinks() {
+        use std::{io::Write, os::unix::fs::symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let missing = temp.path().join("missing");
+        symlink(&missing, &path).unwrap();
+        assert_eq!(
+            publish_summary(&path, |file| file.write_all(b"{}")).unwrap_err(),
+            SummaryError::CreateFile
+        );
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!missing.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let other = temp.path().join("other.json");
+        let staging = other.with_extension("json.tmp");
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, "keep user data").unwrap();
+        symlink(&victim, &staging).unwrap();
+        assert_eq!(
+            publish_summary(&other, |_| panic!("must not follow staging symlink")).unwrap_err(),
+            SummaryError::CreateFile
+        );
+        assert!(std::fs::symlink_metadata(staging)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep user data");
+        assert!(!other.exists());
+    }
+
+    #[test]
+    fn summary_storage_failure_preserves_the_completed_report() {
+        let (temp, w) = workspace();
+        let dir = temp.path().join("not-a-directory");
+        std::fs::write(&dir, "keep").unwrap();
+        let options = RunOptions {
+            summary_dir: Some(dir.clone()),
+            ..RunOptions::default()
+        };
+        let result = run(
+            &Script::new(vec![Ok(turn_with(vec![], "completed answer"))]),
+            &w,
+            "test",
+            &options,
+            &mut Trace::disabled(),
+        );
+        assert!(
+            result.is_ok(),
+            "summary failure must not discard the run report"
+        );
+        let report = result.unwrap();
+        assert_eq!(report.stop, StopReason::Completed);
+        assert_eq!(report.answer.as_deref(), Some("completed answer"));
+        assert_eq!(report.rounds, 1);
+        assert_eq!(report.model_attempts, 1);
+        assert_eq!(report.transcript.len(), 2);
+        assert!(report.summary_path.is_none());
+        assert_eq!(report.summary_error, Some(SummaryError::CreateDirectory));
+        assert_eq!(report.usage.input_tokens, Some(10));
+        assert_eq!(report.usage.output_tokens, Some(2));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["summary_error"],
+            "create_directory"
+        );
+        assert_eq!(std::fs::read_to_string(dir).unwrap(), "keep");
+    }
+
+    #[test]
+    fn summary_collision_preserves_the_existing_file() {
+        let (_temp, w) = workspace();
+        let summaries = tempfile::tempdir().unwrap();
+        let options = RunOptions {
+            summary_dir: Some(summaries.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        let mut trace = Trace::disabled();
+        let path = summaries.path().join(format!("{}.json", trace.run_id()));
+        std::fs::write(&path, "existing summary").unwrap();
+        let result = run(
+            &Script::new(vec![Ok(turn_with(vec![], "new answer"))]),
+            &w,
+            "test",
+            &options,
+            &mut trace,
+        );
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing summary");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(summaries.path()).unwrap().count(), 1);
+        let report = result.unwrap();
+        assert_eq!(report.answer.as_deref(), Some("new answer"));
+        assert!(report.summary_path.is_none());
+        assert_eq!(report.summary_error, Some(SummaryError::CreateFile));
+    }
+
+    #[test]
+    fn summary_failure_preserves_failed_run_outcomes() {
+        let (temp, w) = workspace();
+        let dir = temp.path().join("not-a-directory");
+        std::fs::write(&dir, "keep").unwrap();
+        let options = RunOptions {
+            summary_dir: Some(dir),
+            budget: Budget {
+                max_rounds: 1,
+                max_retries: 0,
+                ..Budget::default()
+            },
+            ..RunOptions::default()
+        };
+        let cases = [
+            (
+                Err(ModelError::Provider(ProviderFailure::Connect)),
+                StopReason::ProviderError {
+                    failure: ProviderFailure::Connect,
+                    attempts: 1,
+                },
+                0,
+            ),
+            (
+                Err(ModelError::Invalid("invalid fixture".into())),
+                StopReason::InvalidResponse {
+                    reason: "invalid fixture".into(),
+                },
+                0,
+            ),
+            (
+                Ok(turn_with(
+                    vec![call(0, "read_file", json!({"path":"hello.txt"}))],
+                    "partial",
+                )),
+                StopReason::BudgetExceeded {
+                    limit: Limit::Rounds,
+                },
+                1,
+            ),
+        ];
+        for (turn, stop, calls) in cases {
+            let report = go(&Script::new(vec![turn]), &w, options.clone());
+            assert_eq!(report.stop, stop);
+            assert_eq!(report.tool_calls, calls);
+            assert_eq!(report.model_attempts, 1);
+            assert_eq!(report.summary_error, Some(SummaryError::CreateDirectory));
+            assert!(report.summary_path.is_none());
+            assert!(report.answer.is_none());
+            if calls > 0 {
+                assert_eq!(report.last_text.as_deref(), Some("partial"));
+                assert_eq!(report.transcript.len(), 3);
+            }
+        }
+        let mut trace = Trace::to_writer(Box::new(FailAfterLines(0)));
+        let report = run(&Script::new(vec![]), &w, "test", &options, &mut trace).unwrap();
+        assert_eq!(report.stop, StopReason::TraceFailed);
+        assert_eq!(report.model_attempts, 0);
+        assert!(report.answer.is_none());
+        assert_eq!(report.summary_error, Some(SummaryError::CreateDirectory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summary_files_refuse_existing_links() {
+        use std::os::unix::fs::symlink;
+        let (_temp, w) = workspace();
+        let summaries = tempfile::tempdir().unwrap();
+        let victim = summaries.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let options = RunOptions {
+            summary_dir: Some(summaries.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        for hardlink in [false, true] {
+            let mut trace = Trace::disabled();
+            let path = summaries.path().join(format!("{}.json", trace.run_id()));
+            if hardlink {
+                std::fs::hard_link(&victim, &path).unwrap();
+            } else {
+                symlink(&victim, &path).unwrap();
+            }
+            let report = run(
+                &Script::new(vec![Ok(turn_with(vec![], "answer"))]),
+                &w,
+                "test",
+                &options,
+                &mut trace,
+            )
+            .unwrap();
+            assert_eq!(report.stop, StopReason::Completed);
+            assert_eq!(report.summary_error, Some(SummaryError::CreateFile));
+            assert!(report.summary_path.is_none());
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
+            assert!(!path.with_extension("json.tmp").exists());
+        }
+    }
+
+    #[test]
     fn report_records_model_settings_and_one_summary_per_run() {
         let (_t, w) = workspace();
         let dir = tempfile::tempdir().unwrap();
@@ -1624,6 +2005,11 @@ mod tests {
         };
         let report = run(&model, &w, "test", &options, &mut Trace::disabled()).unwrap();
         assert_eq!(report.model, "fixture-model");
+        assert!(report.summary_error.is_none());
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("summary_error")
+            .is_none());
         assert!(!report.settings.text_only);
         assert_eq!(report.settings.budget.max_rounds, 4);
         assert_eq!(report.settings.repeat_warn, 5);

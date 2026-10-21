@@ -103,6 +103,14 @@ are listed below and are part of each tool's contract.
 | `search_text` | Literal search over redacted text, depth-first in name order: at most 20,000 entries, depth 8, 256 KiB per file, 16 MiB total; binary, unreadable, and hardlinked files are counted in `skipped_files` |
 | `read_tool_result` | Read-only page of a saved full tool result (`result_id`, byte `offset` / `limit`). It cannot read the workspace |
 
+Saved-result pages seek directly to the requested offset and read at most `limit + 3`
+bytes (at most 8,195 bytes), including UTF-8 lookahead, regardless of total result size.
+The agent checks the tool/run deadline before and after this read and JSON rendering.
+These checks are cooperative: a blocking filesystem syscall cannot be interrupted.
+Library callers can use `SavedResults::read_with_deadline`; `read` remains available
+without deadline checks. The saved length is fixed when issued; later appended bytes
+are excluded. Concurrent modification of existing saved bytes is unsupported.
+
 Every result reports truncation. Output that would exceed the tool-result cap is
 shortened to fit (a read page ends earlier; lists and searches return fewer items)
 rather than failing. Whenever a result is truncated, the full tool text is saved
@@ -143,6 +151,22 @@ capability-relative opens guard root escape, but name and file-type checks happe
 the open and are not an atomic content-classification boundary. Use a stable workspace.
 
 ## Run records
+
+`ask` attempts to save a metadata summary after every run. If storage fails, the CLI
+warns on stderr and retains the run's original answer, stop reason, and exit code.
+Library callers receive `RunReport::summary_error` (`invalid_run_id`, `encode`,
+`create_directory`, `create_file`, or `write_file`) and no `summary_path`. Successful
+reports omit `summary_error` from JSON. The complete summary is written and closed in
+an exclusively created `{run_id}.json.tmp` file beside its destination, then published
+with a hard link. The final `.json` name appears atomically with complete content;
+existing files, symlinks (including dangling links), and hardlinks are refused.
+Filesystems without hard-link support fail safely with `create_file`; there is no
+overwrite or copy fallback. Cleanup removes only staging created by that operation;
+pre-existing staging files are refused and preserved. Cleanup is best effort: a crash
+or failed unlink can leave `.tmp` files. Use a stable, trusted summary directory;
+concurrent hostile replacement of staging paths or directory components is unsupported.
+Atomic final-name visibility does not guarantee durable storage after power loss:
+neither the file nor its directory is synced.
 
 With `--trace FILE`, each run appends JSON lines of the form
 `{"v":1,"seq":N,"wall_time":<unix ms>,"run_id":"...","kind":"...","payload":{...}}`.
