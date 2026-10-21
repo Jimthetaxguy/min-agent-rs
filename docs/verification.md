@@ -1,5 +1,38 @@
 # min-agent verification
 
+## Summary persistence preserves run outcomes (2026-10-21)
+
+Verified by Codex on Apple Silicon macOS with Rust 1.98.1, on top of the bounded
+paging commit `7a4a36c`. No dependencies changed and no live provider was called.
+Builds used the isolated checkout's target directory with at most two Cargo jobs.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo check --locked --offline --all-targets` | Passed |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | Passed |
+| `cargo test --locked --offline -- --test-threads=1` | 67 library, 2 CLI, 9 HTTP tests passed; 1 live test ignored |
+| `cargo build --locked --offline` | Passed |
+| `python3 tests/acceptance.py target/debug/min-agent` | 27/27 passed |
+| `python3 tests/test_heldout_eval.py` | 10/10 passed |
+| `python3 tests/heldout_eval.py target/debug/min-agent` | 5/5 scripted regression tasks passed |
+| `cargo +1.88.0 check --locked --offline --all-targets` | Passed |
+| `cargo deny --locked --offline check advisories bans licenses sources` | Passed with cached advisory data; existing duplicate `windows-sys` and yanked `yoke-derive` warnings remain |
+| `CARGO_NET_OFFLINE=true ./scripts/check-release-size.sh` | Passed: 1,668,560 bytes on aarch64-apple-darwin, below 2,411,596 |
+
+The two initial regressions reproduced report loss on summary-directory failure and
+overwriting an existing summary before the production fix. Four new library tests
+now verify retained completed/failed outcomes, usage and transcript preservation,
+file collision refusal, and symlink/hardlink refusal. Two new black-box tests cover
+four CLI scenarios: completion plus budget, protocol, and provider failure. The
+existing trace-failure contract remains covered. Independent review found no
+actionable production defects.
+
+Summary persistence is best-effort metadata, with a typed error on the report and a
+CLI warning. Exclusive file creation prevents replacing existing final targets;
+it does not provide crash atomicity or durable storage. Partial files can remain
+after failed writes. Linux release size and hosted CI were not run locally.
+
 ## Bounded saved-result paging (2026-10-20)
 
 Verified by Codex on Apple Silicon macOS with Rust 1.98.1, based on main `b0249b6`.

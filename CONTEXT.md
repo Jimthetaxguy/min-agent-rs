@@ -31,7 +31,7 @@ live-model results, and `docs/provenance.md` for reuse decisions.
   `Completed` is success.
 - **RunReport**: Returned by every run: model, run settings, stop reason, answer (only if
   completed), last text, counts, identical-call warnings, usage, per-call **CallRecord**s
-  (metadata only), an optional summary path, and the transcript.
+  (metadata only), an optional summary path or typed **SummaryError**, and the transcript.
 - **Protocol violation vs environment answer**: Malformed arguments, duplicate IDs, unknown
   tool, truncation, or refusal stop the run as `InvalidResponse` with nothing executed. Not
   found, denied, wrong type, or invalid arguments are returned to the model as tool errors.
@@ -56,7 +56,9 @@ live-model results, and `docs/provenance.md` for reuse decisions.
   length, reading only the requested window plus at most 3 UTF-8 lookahead bytes. The agent
   applies cooperative tool/run deadline checks. It is read-only and is not a workspace path.
 - **Run summary**: One JSON object per run (`{run_id}.json`) with model, settings, steps,
-  tokens, and each tool call's outcome.
+  tokens, and each tool call's outcome. Files are created exclusively. Persistence failure
+  is a separate `SummaryError` on the report and a CLI warning; the original run outcome
+  survives. Summary writes are not crash-atomic.
 
 ## Current state (2026-10-14)
 

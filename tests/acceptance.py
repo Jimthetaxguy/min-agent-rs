@@ -474,6 +474,61 @@ def test_messages_protocol(binary):
     assert "UNIQUE_FIXTURE_CONTENT" in result_block["content"]
 
 
+def test_summary_storage_failure_keeps_completed_answer(binary):
+    def setup(root, _workspace):
+        (root / "not-a-directory").write_text("preserve existing file")
+
+    def inspect(root):
+        assert (root / "not-a-directory").read_text() == "preserve existing file"
+
+    result, requests = run_case(
+        binary, [completion()], setup=setup, inspect=inspect,
+        extra=("--summary-dir", "{root}/not-a-directory", "--report-json"),
+    )
+    assert_ok(result)
+    assert result.stdout.strip() == "fixture complete"
+    assert len(requests) == 1
+    assert "Warning: run summary was not saved" in result.stderr
+    report = json.loads(result.stderr[result.stderr.index("{\n"):])
+    assert report["stop"] == {"kind": "completed"}
+    assert report["answer"] == "fixture complete"
+    assert report["summary_path"] is None
+    assert report["summary_error"] == "create_directory"
+    assert report["model_attempts"] == 1
+
+
+def test_summary_storage_failure_keeps_failed_exit_codes(binary):
+    def setup(root, _workspace):
+        (root / "not-a-directory").write_text("preserve existing file")
+
+    def unauthorized(handler):
+        handler.send_response(401)
+        handler.send_header("Content-Length", "0")
+        handler.end_headers()
+
+    cases = [
+        ([completion(None, [call()])], 2, "budget_exceeded", 1),
+        ([completion(None, [call(name="unknown_tool")])], 4, "invalid_response", 0),
+        ([unauthorized], 3, "provider_error", 0),
+    ]
+    for responses, code, stop, calls in cases:
+        result, requests = run_case(
+            binary, responses, setup=setup,
+            extra=("--summary-dir", "{root}/not-a-directory", "--report-json",
+                   "--max-rounds", "1", "--max-retries", "0"),
+        )
+        assert result.returncode == code, (result.returncode, result.stderr)
+        assert result.stdout == ""
+        assert len(requests) == 1
+        assert "Warning: run summary was not saved" in result.stderr
+        report = json.loads(result.stderr[result.stderr.index("{\n"):])
+        assert report["stop"]["kind"] == stop
+        assert report["answer"] is None
+        assert report["summary_path"] is None
+        assert report["summary_error"] == "create_directory"
+        assert report["tool_calls"] == calls
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("binary")

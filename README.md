@@ -152,6 +152,14 @@ the open and are not an atomic content-classification boundary. Use a stable wor
 
 ## Run records
 
+`ask` attempts to save a metadata summary after every run. If storage fails, the CLI
+warns on stderr and retains the run's original answer, stop reason, and exit code.
+Library callers receive `RunReport::summary_error` (`invalid_run_id`, `encode`,
+`create_directory`, `create_file`, or `write_file`) and no `summary_path`. Successful
+reports omit `summary_error` from JSON. Summary files are created exclusively:
+existing files, symlinks, and hardlinks are refused. A failed write can leave a partial
+file; summary writes are not crash-atomic and do not guarantee durable storage.
+
 With `--trace FILE`, each run appends JSON lines of the form
 `{"v":1,"seq":N,"wall_time":<unix ms>,"run_id":"...","kind":"...","payload":{...}}`.
 Kinds: `run_start` (profile, protocol, endpoint, model, connection fingerprint, policy

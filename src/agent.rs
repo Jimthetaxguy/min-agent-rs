@@ -199,6 +199,32 @@ pub struct RepeatStop {
     pub count: usize,
 }
 
+/// Summary persistence is optional metadata: its failure does not replace the
+/// execution outcome. Stages are recorded without OS messages or host paths.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SummaryError {
+    InvalidRunId,
+    Encode,
+    CreateDirectory,
+    CreateFile,
+    WriteFile,
+}
+
+impl fmt::Display for SummaryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            Self::InvalidRunId => "run ID is not a single path segment",
+            Self::Encode => "cannot encode run summary",
+            Self::CreateDirectory => "cannot create summary directory",
+            Self::CreateFile => "cannot exclusively create summary file",
+            Self::WriteFile => "cannot write summary file",
+        })
+    }
+}
+
+impl std::error::Error for SummaryError {}
+
 #[derive(Debug, Serialize)]
 pub struct RunReport {
     pub run_id: String,
@@ -220,8 +246,11 @@ pub struct RunReport {
     pub usage: Usage,
     pub elapsed_ms: u64,
     pub calls: Vec<CallRecord>,
-    /// Written when a summary directory was requested.
+    /// Set only after a requested summary was successfully written.
     pub summary_path: Option<PathBuf>,
+    /// A requested summary failed to persist; the original stop and answer survive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_error: Option<SummaryError>,
     /// Full conversation; content, so excluded from serialized reports.
     #[serde(skip)]
     pub transcript: Vec<Item>,
@@ -235,7 +264,8 @@ pub struct RunOptions {
     pub meta: Value,
     /// Model id recorded on the report and the per-run summary. Empty when the caller omits it.
     pub model: String,
-    /// When set, one `{run_id}.json` summary is written here after the run.
+    /// When set, attempt to write one `{run_id}.json` summary after the run.
+    /// Persistence failure is returned on `RunReport::summary_error`, not as `Err`.
     pub summary_dir: Option<PathBuf>,
     /// Parent directory for private per-run tool text. Default: `$TMPDIR/min-agent`.
     pub result_dir: Option<PathBuf>,
@@ -298,6 +328,7 @@ pub fn run(
         elapsed_ms: 0,
         calls: Vec::new(),
         summary_path: None,
+        summary_error: None,
         transcript: vec![Item::User(prompt.to_string())],
     };
     trace.emit(
@@ -349,7 +380,10 @@ pub fn run(
         report.answer = None;
     }
     if let Some(dir) = &options.summary_dir {
-        report.summary_path = Some(write_run_summary(&report, dir)?);
+        match write_run_summary(&report, dir) {
+            Ok(path) => report.summary_path = Some(path),
+            Err(error) => report.summary_error = Some(error),
+        }
     }
     Ok(report)
 }
@@ -854,13 +888,11 @@ fn call_outcome(call: &CallRecord) -> String {
     }
 }
 
-fn write_run_summary(report: &RunReport, dir: &Path) -> Result<PathBuf> {
-    use anyhow::Context;
-    ensure!(
-        !report.run_id.is_empty() && !report.run_id.contains(['/', '\\']),
-        "run id is not a single path segment"
-    );
-    std::fs::create_dir_all(dir).context("Cannot create summary directory")?;
+fn write_run_summary(report: &RunReport, dir: &Path) -> Result<PathBuf, SummaryError> {
+    use std::io::Write;
+    if report.run_id.is_empty() || report.run_id.contains(['/', '\\']) {
+        return Err(SummaryError::InvalidRunId);
+    }
     let path = dir.join(format!("{}.json", report.run_id));
     let tool_calls: Vec<Value> = report
         .calls
@@ -885,9 +917,17 @@ fn write_run_summary(report: &RunReport, dir: &Path) -> Result<PathBuf> {
         "repeat_stop": report.repeat_stop,
         "tool_calls": tool_calls,
     });
-    let mut bytes = serde_json::to_vec_pretty(&summary).context("Cannot encode run summary")?;
+    let mut bytes = serde_json::to_vec_pretty(&summary).map_err(|_| SummaryError::Encode)?;
     bytes.push(b'\n');
-    std::fs::write(&path, bytes).with_context(|| format!("Cannot write {}", path.display()))?;
+    std::fs::create_dir_all(dir).map_err(|_| SummaryError::CreateDirectory)?;
+    // Never truncate an earlier summary or follow a pre-existing final symlink.
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .map_err(|_| SummaryError::CreateFile)?;
+    file.write_all(&bytes)
+        .map_err(|_| SummaryError::WriteFile)?;
     Ok(path)
 }
 
@@ -1626,6 +1666,167 @@ mod tests {
     }
 
     #[test]
+    fn summary_storage_failure_preserves_the_completed_report() {
+        let (temp, w) = workspace();
+        let dir = temp.path().join("not-a-directory");
+        std::fs::write(&dir, "keep").unwrap();
+        let options = RunOptions {
+            summary_dir: Some(dir.clone()),
+            ..RunOptions::default()
+        };
+        let result = run(
+            &Script::new(vec![Ok(turn_with(vec![], "completed answer"))]),
+            &w,
+            "test",
+            &options,
+            &mut Trace::disabled(),
+        );
+        assert!(
+            result.is_ok(),
+            "summary failure must not discard the run report"
+        );
+        let report = result.unwrap();
+        assert_eq!(report.stop, StopReason::Completed);
+        assert_eq!(report.answer.as_deref(), Some("completed answer"));
+        assert_eq!(report.rounds, 1);
+        assert_eq!(report.model_attempts, 1);
+        assert_eq!(report.transcript.len(), 2);
+        assert!(report.summary_path.is_none());
+        assert_eq!(report.summary_error, Some(SummaryError::CreateDirectory));
+        assert_eq!(report.usage.input_tokens, Some(10));
+        assert_eq!(report.usage.output_tokens, Some(2));
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["summary_error"],
+            "create_directory"
+        );
+        assert_eq!(std::fs::read_to_string(dir).unwrap(), "keep");
+    }
+
+    #[test]
+    fn summary_collision_preserves_the_existing_file() {
+        let (_temp, w) = workspace();
+        let summaries = tempfile::tempdir().unwrap();
+        let options = RunOptions {
+            summary_dir: Some(summaries.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        let mut trace = Trace::disabled();
+        let path = summaries.path().join(format!("{}.json", trace.run_id()));
+        std::fs::write(&path, "existing summary").unwrap();
+        let result = run(
+            &Script::new(vec![Ok(turn_with(vec![], "new answer"))]),
+            &w,
+            "test",
+            &options,
+            &mut trace,
+        );
+        assert!(result.is_ok());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "existing summary");
+        let report = result.unwrap();
+        assert_eq!(report.answer.as_deref(), Some("new answer"));
+        assert!(report.summary_path.is_none());
+        assert_eq!(report.summary_error, Some(SummaryError::CreateFile));
+    }
+
+    #[test]
+    fn summary_failure_preserves_failed_run_outcomes() {
+        let (temp, w) = workspace();
+        let dir = temp.path().join("not-a-directory");
+        std::fs::write(&dir, "keep").unwrap();
+        let options = RunOptions {
+            summary_dir: Some(dir),
+            budget: Budget {
+                max_rounds: 1,
+                max_retries: 0,
+                ..Budget::default()
+            },
+            ..RunOptions::default()
+        };
+        let cases = [
+            (
+                Err(ModelError::Provider(ProviderFailure::Connect)),
+                StopReason::ProviderError {
+                    failure: ProviderFailure::Connect,
+                    attempts: 1,
+                },
+                0,
+            ),
+            (
+                Err(ModelError::Invalid("invalid fixture".into())),
+                StopReason::InvalidResponse {
+                    reason: "invalid fixture".into(),
+                },
+                0,
+            ),
+            (
+                Ok(turn_with(
+                    vec![call(0, "read_file", json!({"path":"hello.txt"}))],
+                    "partial",
+                )),
+                StopReason::BudgetExceeded {
+                    limit: Limit::Rounds,
+                },
+                1,
+            ),
+        ];
+        for (turn, stop, calls) in cases {
+            let report = go(&Script::new(vec![turn]), &w, options.clone());
+            assert_eq!(report.stop, stop);
+            assert_eq!(report.tool_calls, calls);
+            assert_eq!(report.model_attempts, 1);
+            assert_eq!(report.summary_error, Some(SummaryError::CreateDirectory));
+            assert!(report.summary_path.is_none());
+            assert!(report.answer.is_none());
+            if calls > 0 {
+                assert_eq!(report.last_text.as_deref(), Some("partial"));
+                assert_eq!(report.transcript.len(), 3);
+            }
+        }
+        let mut trace = Trace::to_writer(Box::new(FailAfterLines(0)));
+        let report = run(&Script::new(vec![]), &w, "test", &options, &mut trace).unwrap();
+        assert_eq!(report.stop, StopReason::TraceFailed);
+        assert_eq!(report.model_attempts, 0);
+        assert!(report.answer.is_none());
+        assert_eq!(report.summary_error, Some(SummaryError::CreateDirectory));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summary_files_refuse_existing_links() {
+        use std::os::unix::fs::symlink;
+        let (_temp, w) = workspace();
+        let summaries = tempfile::tempdir().unwrap();
+        let victim = summaries.path().join("victim");
+        std::fs::write(&victim, "keep").unwrap();
+        let options = RunOptions {
+            summary_dir: Some(summaries.path().to_path_buf()),
+            ..RunOptions::default()
+        };
+        for hardlink in [false, true] {
+            let mut trace = Trace::disabled();
+            let path = summaries.path().join(format!("{}.json", trace.run_id()));
+            if hardlink {
+                std::fs::hard_link(&victim, &path).unwrap();
+            } else {
+                symlink(&victim, &path).unwrap();
+            }
+            let report = run(
+                &Script::new(vec![Ok(turn_with(vec![], "answer"))]),
+                &w,
+                "test",
+                &options,
+                &mut trace,
+            )
+            .unwrap();
+            assert_eq!(report.stop, StopReason::Completed);
+            assert_eq!(report.summary_error, Some(SummaryError::CreateFile));
+            assert!(report.summary_path.is_none());
+            assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+        }
+    }
+
+    #[test]
     fn report_records_model_settings_and_one_summary_per_run() {
         let (_t, w) = workspace();
         let dir = tempfile::tempdir().unwrap();
@@ -1647,6 +1848,11 @@ mod tests {
         };
         let report = run(&model, &w, "test", &options, &mut Trace::disabled()).unwrap();
         assert_eq!(report.model, "fixture-model");
+        assert!(report.summary_error.is_none());
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("summary_error")
+            .is_none());
         assert!(!report.settings.text_only);
         assert_eq!(report.settings.budget.max_rounds, 4);
         assert_eq!(report.settings.repeat_warn, 5);

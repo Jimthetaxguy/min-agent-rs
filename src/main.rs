@@ -745,6 +745,9 @@ fn execute() -> Result<u8> {
             if let Some(path) = &report.summary_path {
                 eprintln!("Summary: {}", path.display());
             }
+            if let Some(error) = &report.summary_error {
+                eprintln!("Warning: run summary was not saved: {error}");
+            }
             if report_json {
                 eprintln!("{}", serde_json::to_string_pretty(&report)?);
             } else if report.stop.is_completed() {
