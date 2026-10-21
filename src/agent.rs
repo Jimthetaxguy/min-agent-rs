@@ -920,15 +920,52 @@ fn write_run_summary(report: &RunReport, dir: &Path) -> Result<PathBuf, SummaryE
     let mut bytes = serde_json::to_vec_pretty(&summary).map_err(|_| SummaryError::Encode)?;
     bytes.push(b'\n');
     std::fs::create_dir_all(dir).map_err(|_| SummaryError::CreateDirectory)?;
-    // Never truncate an earlier summary or follow a pre-existing final symlink.
-    let mut file = std::fs::OpenOptions::new()
+    publish_summary(&path, |file| file.write_all(&bytes))?;
+    Ok(path)
+}
+
+/// Only armed after exclusive creation. Close before unlinking for portability;
+/// never remove the destination or a pre-existing staging file.
+struct PendingSummary {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+}
+
+impl Drop for PendingSummary {
+    fn drop(&mut self) {
+        drop(self.file.take());
+        // Cleanup cannot undo a successful publication. A cleanup failure or
+        // process crash may leave a .tmp file, never a partial final summary.
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Final-name visibility is atomic on filesystems supporting hard links. Neither
+/// name is synced for power-loss durability. Requires a stable summary directory.
+fn publish_summary(
+    path: &Path,
+    write: impl FnOnce(&mut std::fs::File) -> std::io::Result<()>,
+) -> Result<(), SummaryError> {
+    let staging = path.with_extension("json.tmp");
+    let file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&path)
+        .open(&staging)
         .map_err(|_| SummaryError::CreateFile)?;
-    file.write_all(&bytes)
-        .map_err(|_| SummaryError::WriteFile)?;
-    Ok(path)
+    let mut pending = PendingSummary {
+        path: staging,
+        file: Some(file),
+    };
+    let written = write(pending.file.as_mut().expect("newly created staging file"));
+    // Windows and other platforms may restrict linking/unlinking an open file.
+    // Close on both the success and failure paths before guard cleanup.
+    drop(pending.file.take());
+    written.map_err(|_| SummaryError::WriteFile)?;
+    // Same-directory hard-link creation never replaces an existing destination,
+    // including a dangling symlink. Do not fall back to copy or overwrite-rename.
+    std::fs::hard_link(&pending.path, path).map_err(|_| SummaryError::CreateFile)?;
+    // Drop owns only staging; the published name remains even if cleanup fails.
+    Ok(())
 }
 
 #[cfg(test)]
@@ -1666,6 +1703,123 @@ mod tests {
     }
 
     #[test]
+    fn summary_publication_is_invisible_until_the_write_completes() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let bytes = b"{\"stop\":{\"kind\":\"completed\"}}\n";
+        publish_summary(&path, |file| {
+            file.write_all(&bytes[..8])?;
+            assert!(!path.try_exists().unwrap(), "no partial final summary");
+            file.write_all(&bytes[8..])?;
+            assert!(
+                !path.try_exists().unwrap(),
+                "publish only after writer returns"
+            );
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        let value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(value["stop"]["kind"], "completed");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn summary_partial_write_failure_cleans_only_the_owned_staging_file() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let user_file = temp.path().join("user.json.tmp");
+        std::fs::write(&user_file, "keep user data").unwrap();
+        let error = publish_summary(&path, |file| {
+            file.write_all(b"{\"unfinished\":")?;
+            assert!(!path.try_exists().unwrap());
+            Err(std::io::Error::other("injected write failure"))
+        })
+        .unwrap_err();
+        assert_eq!(error, SummaryError::WriteFile);
+        assert!(!path.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(
+            std::fs::read_to_string(user_file).unwrap(),
+            "keep user data"
+        );
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn summary_preexisting_staging_file_is_never_deleted_or_written() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let staging = path.with_extension("json.tmp");
+        std::fs::write(&staging, "pre-existing data").unwrap();
+        let error =
+            publish_summary(&path, |_| panic!("must not write existing staging file")).unwrap_err();
+        assert_eq!(error, SummaryError::CreateFile);
+        assert_eq!(
+            std::fs::read_to_string(staging).unwrap(),
+            "pre-existing data"
+        );
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn summary_publication_refuses_a_destination_created_during_the_write() {
+        use std::io::Write;
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let error = publish_summary(&path, |file| {
+            file.write_all(b"{\"new\":true}")?;
+            std::fs::write(&path, "winning summary")?;
+            Ok(())
+        })
+        .unwrap_err();
+        assert_eq!(error, SummaryError::CreateFile);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "winning summary");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn summary_publication_refuses_dangling_and_staging_symlinks() {
+        use std::{io::Write, os::unix::fs::symlink};
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("run.json");
+        let missing = temp.path().join("missing");
+        symlink(&missing, &path).unwrap();
+        assert_eq!(
+            publish_summary(&path, |file| file.write_all(b"{}")).unwrap_err(),
+            SummaryError::CreateFile
+        );
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!missing.exists());
+        assert!(!path.with_extension("json.tmp").exists());
+
+        let other = temp.path().join("other.json");
+        let staging = other.with_extension("json.tmp");
+        let victim = temp.path().join("victim");
+        std::fs::write(&victim, "keep user data").unwrap();
+        symlink(&victim, &staging).unwrap();
+        assert_eq!(
+            publish_summary(&other, |_| panic!("must not follow staging symlink")).unwrap_err(),
+            SummaryError::CreateFile
+        );
+        assert!(std::fs::symlink_metadata(staging)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "keep user data");
+        assert!(!other.exists());
+    }
+
+    #[test]
     fn summary_storage_failure_preserves_the_completed_report() {
         let (temp, w) = workspace();
         let dir = temp.path().join("not-a-directory");
@@ -1721,7 +1875,9 @@ mod tests {
             &mut trace,
         );
         assert!(result.is_ok());
-        assert_eq!(std::fs::read_to_string(path).unwrap(), "existing summary");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "existing summary");
+        assert!(!path.with_extension("json.tmp").exists());
+        assert_eq!(std::fs::read_dir(summaries.path()).unwrap().count(), 1);
         let report = result.unwrap();
         assert_eq!(report.answer.as_deref(), Some("new answer"));
         assert!(report.summary_path.is_none());
@@ -1822,7 +1978,8 @@ mod tests {
             assert_eq!(report.summary_error, Some(SummaryError::CreateFile));
             assert!(report.summary_path.is_none());
             assert_eq!(std::fs::read_to_string(&victim).unwrap(), "keep");
-            assert_eq!(std::fs::read_to_string(path).unwrap(), "keep");
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), "keep");
+            assert!(!path.with_extension("json.tmp").exists());
         }
     }
 

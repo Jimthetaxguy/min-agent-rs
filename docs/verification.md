@@ -1,5 +1,42 @@
 # min-agent verification
 
+## Atomic summary publication (2026-10-21)
+
+Verified by Codex on Apple Silicon macOS with Rust 1.98.1, preserving commits
+`7a4a36c` and `610f502`. No dependency or lockfile changes. Build/test checks ran
+sequentially with an isolated target directory and at most two Cargo build jobs.
+
+| Check | Result |
+| --- | --- |
+| `cargo fmt --check` | Passed |
+| `cargo check --locked --offline --all-targets` | Passed |
+| `cargo clippy --locked --offline --all-targets -- -D warnings` | Passed |
+| `cargo test --locked --offline -- --test-threads=1` | 72 library, 2 CLI, 9 HTTP tests passed; 1 live test ignored |
+| `cargo build --locked --offline` | Passed |
+| `python3 tests/acceptance.py target/debug/min-agent` | 27/27 passed |
+| `python3 tests/test_heldout_eval.py` | 10/10 passed |
+| `python3 tests/heldout_eval.py target/debug/min-agent` | 5/5 scripted tasks passed |
+| `cargo +1.88.0 check --locked --offline --all-targets` | Passed |
+| `cargo deny --locked --offline check advisories bans licenses sources` | Passed with cached advisory data; existing duplicate `windows-sys` and yanked `yoke-derive` warnings remain |
+| `CARGO_NET_OFFLINE=true ./scripts/check-release-size.sh` | Passed: 1,668,672 bytes on aarch64-apple-darwin, below 2,411,596 |
+
+Five new deterministic library tests exercise successful publication with no final
+name visible during writes, cleanup after an injected partial-write failure,
+preservation of an existing staging file, a destination collision introduced during
+writing, and dangling destination/staging symlinks. Existing tests continue to verify
+regular-file and hardlink collisions, report/error semantics, CLI exit codes, and
+valid JSON summaries. Independent review found no actionable defects under the
+documented stable, trusted summary-directory assumption.
+
+Publication uses the standard library's `hard_link`, which refuses existing destination
+names, without a copy or overwrite-rename fallback. Filesystems without hard-link
+support fail safely as `SummaryError::CreateFile`. Cleanup is limited to this
+operation's exclusively created staging file and is best effort. A crash or cleanup
+failure can leave `.tmp` files. Neither file data nor directory entries are synced;
+atomic final-name visibility is not power-loss durability. Hostile concurrent staging
+path or directory replacement is unsupported. No live-provider request, hosted CI,
+Linux runtime test, or Linux release-size measurement was performed.
+
 ## Summary persistence preserves run outcomes (2026-10-21)
 
 Verified by Codex on Apple Silicon macOS with Rust 1.98.1, on top of the bounded

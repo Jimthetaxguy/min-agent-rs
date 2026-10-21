@@ -58,7 +58,10 @@ live-model results, and `docs/provenance.md` for reuse decisions.
 - **Run summary**: One JSON object per run (`{run_id}.json`) with model, settings, steps,
   tokens, and each tool call's outcome. Files are created exclusively. Persistence failure
   is a separate `SummaryError` on the report and a CLI warning; the original run outcome
-  survives. Summary writes are not crash-atomic.
+  survives. A closed, fully written sibling staging file is published with a no-clobber
+  hard link; final-name visibility is atomic on filesystems supporting hard links.
+  Staging cleanup is best effort. A stable, trusted directory is required; power-loss
+  durability is not guaranteed.
 
 ## Current state (2026-10-14)
 

@@ -156,9 +156,17 @@ the open and are not an atomic content-classification boundary. Use a stable wor
 warns on stderr and retains the run's original answer, stop reason, and exit code.
 Library callers receive `RunReport::summary_error` (`invalid_run_id`, `encode`,
 `create_directory`, `create_file`, or `write_file`) and no `summary_path`. Successful
-reports omit `summary_error` from JSON. Summary files are created exclusively:
-existing files, symlinks, and hardlinks are refused. A failed write can leave a partial
-file; summary writes are not crash-atomic and do not guarantee durable storage.
+reports omit `summary_error` from JSON. The complete summary is written and closed in
+an exclusively created `{run_id}.json.tmp` file beside its destination, then published
+with a hard link. The final `.json` name appears atomically with complete content;
+existing files, symlinks (including dangling links), and hardlinks are refused.
+Filesystems without hard-link support fail safely with `create_file`; there is no
+overwrite or copy fallback. Cleanup removes only staging created by that operation;
+pre-existing staging files are refused and preserved. Cleanup is best effort: a crash
+or failed unlink can leave `.tmp` files. Use a stable, trusted summary directory;
+concurrent hostile replacement of staging paths or directory components is unsupported.
+Atomic final-name visibility does not guarantee durable storage after power loss:
+neither the file nor its directory is synced.
 
 With `--trace FILE`, each run appends JSON lines of the form
 `{"v":1,"seq":N,"wall_time":<unix ms>,"run_id":"...","kind":"...","payload":{...}}`.
