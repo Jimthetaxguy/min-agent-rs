@@ -510,13 +510,8 @@ impl Workspace {
         // BEGIN line is on an earlier page is recognized) and a little after (so a token cut
         // by the page end is recognized). Only the page itself is returned.
         let before = a.offset.min(REDACT_CONTEXT_BEFORE);
-        file.seek(SeekFrom::Start(a.offset - before))
-            .map_err(io_error)?;
         let pre = before as usize;
-        let mut context = Vec::new();
-        file.take(before + a.limit as u64 + 3 + REDACT_CONTEXT_AFTER)
-            .read_to_end(&mut context)
-            .map_err(io_error)?;
+        let context = workspace_window(&mut file, len, a.offset, a.limit)?;
         let bytes = &context[pre..];
         let ranges = redact::find(&context);
         // Up to 3 extra bytes let a character straddling the limit be completed.
@@ -612,11 +607,12 @@ impl Workspace {
                     truncated = true;
                     continue;
                 }
-                let mut bytes = Vec::new();
-                file.take(FILE_SCAN_LIMIT + 1)
-                    .read_to_end(&mut bytes)
-                    .map_err(io_error)?;
+                let (bytes, incomplete) = search_window(file, SEARCH_BYTE_LIMIT - bytes_read)?;
                 bytes_read += bytes.len() as u64;
+                if incomplete {
+                    truncated = true;
+                    continue;
+                }
                 if std::str::from_utf8(&bytes).is_err() {
                     skipped += 1;
                     continue;
@@ -678,6 +674,32 @@ impl Workspace {
             output_limit,
         )
     }
+}
+
+fn workspace_window(
+    file: &mut (impl Read + Seek),
+    file_len: u64,
+    offset: u64,
+    limit: usize,
+) -> ToolResult<Vec<u8>> {
+    let before = offset.min(REDACT_CONTEXT_BEFORE);
+    let start = offset - before;
+    let available = file_len.checked_sub(start).ok_or_else(|| {
+        ToolError::new(ToolErrorKind::Io, "Workspace file changed during the call")
+    })?;
+    let length = available.min(before + limit as u64 + 3 + REDACT_CONTEXT_AFTER);
+    file.seek(SeekFrom::Start(start)).map_err(io_error)?;
+    let mut context = vec![0; length as usize];
+    file.read_exact(&mut context).map_err(io_error)?;
+    Ok(context)
+}
+
+fn search_window(file: impl Read, remaining: u64) -> ToolResult<(Vec<u8>, bool)> {
+    let limit = remaining.min(FILE_SCAN_LIMIT + 1);
+    let mut bytes = Vec::new();
+    file.take(limit).read_to_end(&mut bytes).map_err(io_error)?;
+    let incomplete = bytes.len() as u64 == limit;
+    Ok((bytes, incomplete))
 }
 
 fn is_continuation(byte: u8) -> bool {
@@ -1087,6 +1109,66 @@ mod tests {
         let value: Value = serde_json::from_str(&out.content).unwrap();
         let next = value["next_offset"].as_u64().unwrap();
         assert!(next > 4000 && next < 8192, "{next}");
+    }
+
+    #[test]
+    fn workspace_windows_reject_files_shortened_after_metadata() {
+        for (original_len, offset, shortened_len) in [(4096, 2048, 0), (8, 0, 4)] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.set_len(original_len).unwrap();
+            let observed_len = file.metadata().unwrap().len();
+            file.set_len(shortened_len).unwrap();
+            let error = workspace_window(&mut file, observed_len, offset, READ_LIMIT).unwrap_err();
+            assert_eq!(error.kind, ToolErrorKind::Io);
+        }
+    }
+
+    #[test]
+    fn workspace_windows_keep_the_observed_extent_after_growth() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(32).unwrap();
+        let observed_len = file.metadata().unwrap().len();
+        file.set_len(READ_LIMIT as u64 * 2).unwrap();
+        let context = workspace_window(&mut file, observed_len, 16, READ_LIMIT).unwrap();
+        assert_eq!(context.len(), 32);
+        assert_eq!(file.stream_position().unwrap(), observed_len);
+    }
+
+    #[test]
+    fn search_windows_bound_actual_reads_after_file_growth() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.set_len(8).unwrap();
+        let observed_len = file.metadata().unwrap().len();
+        let remaining = 32;
+        assert!(observed_len < remaining);
+        file.set_len(1024).unwrap();
+        let (bytes, incomplete) = search_window(&mut file, remaining).unwrap();
+        assert_eq!(bytes.len() as u64, remaining);
+        assert_eq!(file.stream_position().unwrap(), remaining);
+        assert!(incomplete);
+    }
+
+    #[test]
+    fn search_windows_distinguish_complete_files_from_exhausted_budgets() {
+        for (file_len, remaining, expected_bytes, incomplete) in [
+            (FILE_SCAN_LIMIT, SEARCH_BYTE_LIMIT, FILE_SCAN_LIMIT, false),
+            (
+                FILE_SCAN_LIMIT + 2,
+                SEARCH_BYTE_LIMIT,
+                FILE_SCAN_LIMIT + 1,
+                true,
+            ),
+            (31, 32, 31, false),
+            (32, 32, 32, true),
+            (0, 32, 0, false),
+            (32, 0, 0, true),
+        ] {
+            let mut reader = io::Cursor::new(vec![b'x'; file_len as usize]);
+            let (bytes, actual_incomplete) = search_window(&mut reader, remaining).unwrap();
+            assert_eq!(bytes.len() as u64, expected_bytes);
+            assert_eq!(reader.position(), expected_bytes);
+            assert_eq!(actual_incomplete, incomplete);
+        }
     }
 
     #[test]
