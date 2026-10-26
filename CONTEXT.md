@@ -43,7 +43,8 @@ live-model results, and `docs/provenance.md` for reuse decisions.
   opaque `Prepared`; `execute()` performs the bounded read. `Effect` has one variant, `Read`;
   adding a variant is gated on the entry criteria in the README.
 - **Redaction**: Known credential shapes in tool output become `[REDACTED]` (`redact.rs`).
-  A backstop, not a scanner.
+  A backstop, not a scanner. `find` walks forward: PEM blocks are skipped with an index,
+  and earlier matches are not searched again at every byte.
 - **Trace**: Optional append-only JSONL run record `{v, seq, wall_time, run_id, kind, payload}`;
   metadata only; readers skip unknown kinds.
 - **Text-only mode**: No tool schema is sent and no tool call can execute.
