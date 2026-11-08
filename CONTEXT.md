@@ -59,6 +59,9 @@ live-model results, and `docs/provenance.md` for reuse decisions.
   workspace. `read_tool_result` pages that text through the issued handle and fixed saved
   length, reading only the requested window plus at most 3 UTF-8 lookahead bytes. The agent
   applies cooperative tool/run deadline checks. It is read-only and is not a workspace path.
+- **Page annotation budget**: Workspace file pages reserve saved-result metadata and repeat
+  warning space before choosing their source-byte cursor. Later annotations cannot clip
+  page content behind `next_offset`; unexpected envelope overflow returns a tool error.
 - **Run summary**: One JSON object per run (`{run_id}.json`) with model, settings, steps,
   tokens, and each tool call's outcome. Files are created exclusively. Persistence failure
   is a separate `SummaryError` on the report and a CLI warning; the original run outcome
