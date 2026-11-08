@@ -42,6 +42,10 @@ live-model results, and `docs/provenance.md` for reuse decisions.
   capability. `prepare()` validates arguments and path policy before any read and returns an
   opaque `Prepared`; `execute()` performs the bounded read. `Effect` has one variant, `Read`;
   adding a variant is gated on the entry criteria in the README.
+- **Workspace read extent**: File pages stay within the length observed when opened;
+  shortening a requested window returns an I/O error. Search charges actual bytes read
+  against its total budget, including oversized-file detection. A file exhausting that
+  budget is skipped with truncation because EOF could not be established within the cap.
 - **Redaction**: Known credential shapes in tool output become `[REDACTED]` (`redact.rs`).
   A backstop, not a scanner.
 - **Trace**: Optional append-only JSONL run record `{v, seq, wall_time, run_id, kind, payload}`;
