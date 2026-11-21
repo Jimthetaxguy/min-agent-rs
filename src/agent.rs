@@ -388,6 +388,47 @@ pub fn run(
     Ok(report)
 }
 
+/// What the model-attempt loop does after a provider failure has been recorded.
+#[derive(Debug, PartialEq)]
+enum AfterError {
+    /// End the run with this stop.
+    Stop(StopReason),
+    /// Sleep this long, then dispatch another attempt.
+    RetryAfter(Duration),
+}
+
+/// Transition for a failed model attempt. Order matters: a failed trace stops first
+/// (no unaudited attempt may follow), then non-retryable failures and an exhausted
+/// retry budget, then a delay that would not fit the run (a server-requested delay is
+/// honored in full or not at all).
+fn after_provider_error(
+    failure: ProviderFailure,
+    attempt: u32,
+    max_retries: u32,
+    remaining: Duration,
+    trace_failed: bool,
+) -> AfterError {
+    if trace_failed {
+        return AfterError::Stop(StopReason::TraceFailed);
+    }
+    if !failure.retryable() || attempt > max_retries {
+        return AfterError::Stop(StopReason::ProviderError {
+            failure,
+            attempts: attempt,
+        });
+    }
+    let backoff = failure
+        .retry_after()
+        .unwrap_or(Duration::from_millis(500 << (attempt - 1).min(4)));
+    if backoff >= remaining {
+        return AfterError::Stop(StopReason::ProviderError {
+            failure,
+            attempts: attempt,
+        });
+    }
+    AfterError::RetryAfter(backoff)
+}
+
 fn drive(
     model: &dyn ModelClient,
     workspace: &Workspace,
@@ -461,23 +502,16 @@ fn drive(
                 }
                 Err(ModelError::Provider(failure)) => {
                     trace.emit("model_error", json!({"round":round,"attempt":attempt,"failure":failure,"elapsed_ms":elapsed_ms}));
-                    if !failure.retryable() || attempt > budget.max_retries {
-                        return StopReason::ProviderError {
-                            failure,
-                            attempts: attempt,
-                        };
+                    match after_provider_error(
+                        failure,
+                        attempt,
+                        budget.max_retries,
+                        deadline.saturating_duration_since(Instant::now()),
+                        trace.failed(),
+                    ) {
+                        AfterError::Stop(reason) => return reason,
+                        AfterError::RetryAfter(backoff) => std::thread::sleep(backoff),
                     }
-                    let backoff = failure
-                        .retry_after()
-                        .unwrap_or(Duration::from_millis(500 << (attempt - 1).min(4)));
-                    // A server-requested delay is honored in full or not at all.
-                    if backoff >= deadline.saturating_duration_since(Instant::now()) {
-                        return StopReason::ProviderError {
-                            failure,
-                            attempts: attempt,
-                        };
-                    }
-                    std::thread::sleep(backoff);
                 }
             }
         };
@@ -1321,6 +1355,64 @@ mod tests {
             "the model finished; only the final record failed"
         );
         assert_eq!(report.stop, StopReason::TraceFailed);
+        assert!(report.answer.is_none());
+    }
+
+    #[test]
+    fn after_provider_error_transitions() {
+        let busy = ProviderFailure::Status {
+            code: 503,
+            retry_after: Some(Duration::from_millis(5)),
+        };
+        let minute = Duration::from_secs(60);
+        assert_eq!(
+            after_provider_error(busy, 1, 2, minute, false),
+            AfterError::RetryAfter(Duration::from_millis(5))
+        );
+        assert_eq!(
+            after_provider_error(busy, 1, 2, minute, true),
+            AfterError::Stop(StopReason::TraceFailed),
+            "a failed trace outranks a retryable failure"
+        );
+        assert!(matches!(
+            after_provider_error(busy, 3, 2, minute, false),
+            AfterError::Stop(StopReason::ProviderError { attempts: 3, .. })
+        ));
+        assert!(matches!(
+            after_provider_error(busy, 1, 2, Duration::from_millis(5), false),
+            AfterError::Stop(StopReason::ProviderError { attempts: 1, .. })
+        ));
+    }
+
+    /// A retryable provider error whose `model_error` record cannot be written must
+    /// stop the run: the trace contract is stop-rather-than-continue, so no further,
+    /// unaudited model attempt may be dispatched.
+    #[test]
+    fn trace_failure_on_retryable_error_stops_before_another_attempt() {
+        let (_t, w) = workspace();
+        let busy = || {
+            Err(ModelError::Provider(ProviderFailure::Status {
+                code: 503,
+                retry_after: Some(Duration::from_millis(1)),
+            }))
+        };
+        // Entries: a retryable error, then a tool call, then a final answer. Only the
+        // first may be consumed.
+        let model = Script::new(vec![
+            busy(),
+            Ok(turn_with(
+                vec![call(0, "read_file", json!({"path":"hello.txt"}))],
+                "",
+            )),
+            Ok(turn_with(vec![], "done")),
+        ]);
+        // run_start is written; the model_error record fails.
+        let mut trace = Trace::to_writer(Box::new(FailAfterLines(1)));
+        let report = run(&model, &w, "t", &RunOptions::default(), &mut trace).unwrap();
+        assert_eq!(report.stop, StopReason::TraceFailed);
+        assert_eq!(report.model_attempts, 1, "no retry after the audit failed");
+        assert_eq!(model.1.borrow().len(), 1, "exactly one model request");
+        assert_eq!(report.tool_calls, 0);
         assert!(report.answer.is_none());
     }
 
